@@ -5,8 +5,6 @@ import sqlite3
 from audio_metrics import AudioFeatureExtractor,download_audio_to_tempfile,process_track
 
 
-
-
 def get_new_songs(songs):
     conn = sqlite3.connect("music.db")
     cursor = conn.cursor()
@@ -37,7 +35,11 @@ def save(song,genre):
             result=ydl.extract_info(f"ytsearch:{title}",
                                 download=False)
     video=result['entries'][0]
-    cursor.execute(f"INSERT INTO {genre}(id,name,artist,album,genre,year,link,duration,bpm,energy,danceability,valence,acousticness,instrumentalness,likeability)VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",(song['id'],song['title'],song['artist-credit-phrase'],None,genre,None,video['url'],song['length'],))
+    extractor = AudioFeatureExtractor()
+    features = process_track(video['url'], extractor)
+    
+    
+    cursor.execute(f"INSERT INTO {genre}(id,name,artist,album,genre,year,link,duration,bpm,energy,danceability,valence,acousticness,instrumentalness,likeability)VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",(song['id'],song['title'],song['artist-credit-phrase'],None,genre,None,video['url'],song['length'],features['bpm'],features['energy'],features['danceability'],features['valence'],features['acousticness'],features['instrumentalness']))
 
     
     
@@ -60,20 +62,28 @@ song = random.choice(recordings)
 print(f"Song: {song['title']}")
 print(f"ID: {song['id']}")
 print(song.keys())
-exclude={'artist-credit','ext:score','isrc-list','release-list'}
+exclude={'artist-credit','ext:score','isrc-list'}
 songs={k:v for k,v in song.items() if k not in exclude}
-print(songs)
-title=str(song['title'])
 
+if song['release-list'][0]['date'] != None:
+    print(song['release-list'][0]['date'])
+    year=song['release-list'][0]['date']
+else:
+    print("No year ")
+album=song['release-list'][0]['release-group']['title']
+print(album)
+title=str(song['title'])
+print(f"Title:{title} by {song['artist-credit-phrase']}")
+query=f"{title} by {song['artist-credit-phrase']}-{album}"
+print(query)
 with yt_dlp.YoutubeDL(options) as ydl:
-    result=ydl.extract_info(f"ytsearch:{title}",
+    result=ydl.extract_info(f"ytsearch:{query}",
                             download=False)
     
 video=result['entries'][0]
 print(video["title"])
 print(video["url"])
 
-
 extractor = AudioFeatureExtractor()
-features = process_track("https://www.youtube.com/watch?v=btPJPFnesV4", extractor)
+features = process_track(video['url'], extractor)
 print(features)

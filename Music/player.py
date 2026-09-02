@@ -7,6 +7,8 @@ import sys
 import termios
 import tty
 import select
+import time
+from songs import get_random_song
 
 
 class Player:
@@ -16,26 +18,23 @@ class Player:
 
         self.stop_event = threading.Event()
         self.skip_event = threading.Event()
-
+        self.current_length = None
+        self.current_elapsed = None
         self.current_process = None
+        self.current_url = None
+        self.current_rating = None
         self.lock = threading.Lock()
-
-    # -------------------------
-    # CONTROLS
-    # -------------------------
 
     def skip(self):
         self.skip_event.set()
-    # -------------------------
-    # PREPARE SONG
-    # -------------------------
 
     def prepare_song(self, url):
 
         options = {
             'format': 'bestaudio/best',
             'quiet': True,
-            'noplaylist': True
+            'noplaylist': True,
+            # 'js_runtimes': {'deno': None} 
         }
 
         with yt_dlp.YoutubeDL(options) as ydl:
@@ -59,24 +58,27 @@ class Player:
 
         return process
 
-    def preload(self, url):
+    def preload(self, song_info):
+        if song_info is None:
+            print("No song available to preload, fetching a random one.")
+            song_info = get_random_song()
 
-        if url is None:
-            print("No song available to preload.")
-            url=get_random_song() 
+        if song_info is None:
+            print("Could not find a song to preload.")
+            return
 
         try:
-            process = self.prepare_song(url)
-            self.song_queue.put(process)
-            print("Next song preloaded!")
-
+            process = self.prepare_song(song_info['url'])
+            self.song_queue.put({
+                'process': process,
+                'url': song_info['url'],
+                'title': song_info['title'],
+                'length': song_info['length']
+            })
+            print(f"Preloaded: {song_info['title']}")
         except Exception as e:
             print("Preload error:", e)
-
-    # -------------------------
-    # START PRELOAD
-    # -------------------------
-
+                        
     def start_preload(self, get_next_song):
 
         next_url = get_next_song()
@@ -87,9 +89,6 @@ class Player:
             daemon=True
         ).start()
 
-    # -------------------------
-    # GET PRELOADED SONG
-    # -------------------------
 
     def get_preloaded_song(self):
 
@@ -103,18 +102,17 @@ class Player:
 
         return None
 
-    # -------------------------
-    # PLAYBACK
-    # -------------------------
+    def play(self, first_song, get_next_song):
 
-    def play(self, first_url, get_next_song):
-
-        current = self.prepare_song(first_url)
-
+        current = self.prepare_song(first_song['url'])
         with self.lock:
             self.current_process = current
-
+            self.current_url = first_song['url']
+            self.current_title = first_song['title']
+            self.current_length = first_song['length']
+            self.current_start_time = time.time()
         # Preload next song
+        print(f"Now playing: {self.current_title}")
         self.start_preload(get_next_song)
 
         print("\nDJ started!")
@@ -132,52 +130,69 @@ class Player:
             ) as stream:
 
                 while not self.stop_event.is_set():
-
-                    # Skip
+                    
                     if self.skip_event.is_set():
 
                         self.skip_event.clear()
 
-                        print("\nSkipping...")
+                        with self.lock:
+                            self.current_elapsed = time.time() - self.current_start_time
+
+                        self._score_current_song()
 
                         current.kill()
 
-                        current = self.get_preloaded_song()
+                        current_song = self.get_preloaded_song()
 
-                        if current is None:
+                        if current_song is None:
                             break
+
+                        current = current_song['process']
 
                         with self.lock:
                             self.current_process = current
+                            self.current_url = current_song['url']
+                            self.current_title = current_song['title']
+                            self.current_length = current_song['length']
+                            self.current_start_time = time.time()
+                            self.current_rating = None
 
                         print("Starting next song...")
-
                         self.start_preload(get_next_song)
-
                         continue
-
                     # Read audio
                     data = current.stdout.read(
                         4096 * 2 * 2
                     )
 
                     # Song ended
+                    
                     if not data:
+
+                        with self.lock:
+                            self.current_elapsed = time.time() - self.current_start_time
+
+                        self._score_current_song()
 
                         current.kill()
 
-                        current = self.get_preloaded_song()
+                        current_song = self.get_preloaded_song()
 
-                        if current is None:
+                        if current_song is None:
                             break
+
+                        current = current_song['process']
 
                         with self.lock:
                             self.current_process = current
+                            self.current_url = current_song['url']
+                            self.current_title = current_song['title']
+                            self.current_length = current_song['length']
+                            self.current_start_time = time.time()
+                            self.current_rating = None
 
-                        print("\nStarting next song...")
-
+                        print(f"\nNow playing: {current_song['title']}")
                         self.start_preload(get_next_song)
-
                         continue
 
                     stream.write(data)
@@ -191,9 +206,6 @@ class Player:
             except:
                 pass
 
-    # -------------------------
-    # RUN PLAYER IN BACKGROUND
-    # -------------------------
 
     def start(self, first_url, get_next_song):
         
@@ -231,13 +243,38 @@ class Player:
                 except:
                     pass
 
-        # Kill preloaded FFmpeg processes
         while not self.song_queue.empty():
             try:
-                process = self.song_queue.get_nowait()
-                process.kill()
+                song_info = self.song_queue.get_nowait()
+                song_info['process'].kill()
             except queue.Empty:
                 break
+    def rate_current(self, score):
+        with self.lock:
+            if not self.current_url:
+                print("No song currently playing to rate.")
+                return
+            self.current_rating = score
+            title = self.current_title
+
+        print(f"Rating queued for '{title}': {score}")
+    def _score_current_song(self):
+        with self.lock:
+            title = self.current_title
+            length_ms = self.current_length
+            start_time = self.current_start_time
+            score = self.current_rating
+
+        if score is None or not length_ms:
+            return
+
+        seconds_listened = time.time() - start_time
+        listen_fraction = min(seconds_listened / (length_ms / 1000), 1.0)
+        rating = score / 9
+
+        likeability = listen_fraction * rating
+        print(f"'{title}' likeability: {round(likeability, 2)}")
+        
     def keyboard_control(self):
 
         fd = sys.stdin.fileno()
@@ -246,8 +283,8 @@ class Player:
 
         try:
             tty.setcbreak(fd)
-
-            print("\nControls: [n] next | [s] stop | [Ctrl+C] quit\n")
+            
+            print("n = next | s = stop | 0-9 = rate song (0.0-1.0)")
 
             while not self.stop_event.is_set():
 
@@ -267,6 +304,10 @@ class Player:
                     print("\nStopping...")
                     self.stop()
 
+                elif key.isdigit():
+                    score=int(key)
+                    self.rate_current(score)
+                
                 elif key == '\x03':  # Ctrl+C
                     print("\nStopping...")
                     self.stop()
@@ -278,16 +319,15 @@ class Player:
                 termios.TCSADRAIN,
                 old_settings
             )
+            
     
-from songs import get_random_song
+
 
 dj = Player()
 
-dj.start(
-    get_random_song(),
-    get_random_song
-)
+first_song = get_random_song()
 
+dj.start(first_song, get_random_song)
 try:
     dj.player_thread.join()
 

@@ -2,7 +2,7 @@ import musicbrainzngs
 import random
 import yt_dlp
 import sqlite3
-from audio_metrics import AudioFeatureExtractor,download_audio_to_tempfile,process_track
+# from audio_metrics import AudioFeatureExtractor,download_audio_to_tempfile,process_track
 
 
 def get_new_songs(songs):
@@ -35,55 +35,94 @@ def save(song,genre):
             result=ydl.extract_info(f"ytsearch:{title}",
                                 download=False)
     video=result['entries'][0]
-    extractor = AudioFeatureExtractor()
-    features = process_track(video['url'], extractor)
+    # extractor = AudioFeatureExtractor()
+    # features = process_track(video['url'], extractor)
     
     
-    cursor.execute(f"INSERT INTO {genre}(id,name,artist,album,genre,year,link,duration,bpm,energy,danceability,valence,acousticness,instrumentalness,likeability)VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",(song['id'],song['title'],song['artist-credit-phrase'],None,genre,None,video['url'],song['length'],features['bpm'],features['energy'],features['danceability'],features['valence'],features['acousticness'],features['instrumentalness']))
+    # cursor.execute(f"INSERT INTO {genre}(id,name,artist,album,genre,year,link,duration,bpm,energy,danceability,valence,acousticness,instrumentalness,likeability)VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",(song['id'],song['title'],song['artist-credit-phrase'],None,genre,None,video['url'],song['length'],features['bpm'],features['energy'],features['danceability'],features['valence'],features['acousticness'],features['instrumentalness']))
 
-    
-    
-options={
+# extractor = AudioFeatureExtractor()
+# features = process_track(video['url'], extractor)
+# print(features)
+
+def get_random_song():
+    options={
     "quiet":True,
-    "extract_flat":True
-}
+    "extract_flat":True}
 
-musicbrainzngs.set_useragent("DjAgent", "1.0.0", "https://github.com/13lend1")
+    musicbrainzngs.set_useragent("DjAgent", "1.0.0", "https://github.com/13lend1")
 
-result = musicbrainzngs.search_recordings(
-    query="tag:rock",
-    limit=100
-)
+    result = musicbrainzngs.search_recordings(
+        query="tag:r&b",
+        limit=100
+    )
 
-recordings = result["recording-list"]  
+    recordings = result["recording-list"]  
 
-song = random.choice(recordings)
+    song = random.choice(recordings)
 
-print(f"Song: {song['title']}")
-print(f"ID: {song['id']}")
-print(song.keys())
-exclude={'artist-credit','ext:score','isrc-list'}
-songs={k:v for k,v in song.items() if k not in exclude}
-
-if song['release-list'][0]['date'] != None:
-    print(song['release-list'][0]['date'])
-    year=song['release-list'][0]['date']
-else:
-    print("No year ")
-album=song['release-list'][0]['release-group']['title']
-print(album)
-title=str(song['title'])
-print(f"Title:{title} by {song['artist-credit-phrase']}")
-query=f"{title} by {song['artist-credit-phrase']}-{album}"
-print(query)
-with yt_dlp.YoutubeDL(options) as ydl:
-    result=ydl.extract_info(f"ytsearch:{query}",
-                            download=False)
+    print(f"Song: {song['title']}")
+    # if song['release-list'][0]['date'] != None:
+    #     print(song['release-list'][0]['date'])
+    #     year=song['release-list'][0]['date']
+    # else:
+    #     print("No year ")
+    album=song['release-list'][0]['release-group']['title']
+    title=str(song['title'])
+    print(f"Title:{title} by {song['artist-credit-phrase']}")
+    query=f"{title} by {song['artist-credit-phrase']}-{album}"
+    with yt_dlp.YoutubeDL(options) as ydl:
+        result=ydl.extract_info(f"ytsearch:{query}",
+                                download=False)
     
-video=result['entries'][0]
-print(video["title"])
-print(video["url"])
+    entries=result.get('entries',[])
+    if entries:
+        video=entries[0]
+    else:
+        return None 
+    return video['url']
 
-extractor = AudioFeatureExtractor()
-features = process_track(video['url'], extractor)
-print(features)
+if __name__=="__main__":
+        
+    options={
+        "quiet":True,
+        "extract_flat":True
+    }
+
+    musicbrainzngs.set_useragent("DjAgent", "1.0.0", "https://github.com/13lend1")
+
+    result = musicbrainzngs.search_recordings(
+        query="tag:rock",
+        limit=100
+    )
+
+    recordings = result["recording-list"]  
+
+    song = random.choice(recordings)
+
+    print(f"Song: {song['title']}")
+    print(f"ID: {song['id']}")
+    print(song.keys())
+    exclude={'artist-credit','ext:score','isrc-list'}
+    songs={k:v for k,v in song.items() if k not in exclude}
+
+    if song['release-list'][0]['date'] != None:
+        print(song['release-list'][0]['date'])
+        year=song['release-list'][0]['date']
+    else:
+        print("No year ")
+    album=song['release-list'][0]['release-group']['title']
+    print(album)
+    title=str(song['title'])
+    print(f"Title:{title} by {song['artist-credit-phrase']}")
+    query=f"{title} by {song['artist-credit-phrase']}-{album}"
+    print(query)
+    with yt_dlp.YoutubeDL(options) as ydl:
+        result=ydl.extract_info(f"ytsearch:{query}",
+                                download=False)
+        
+    video=result['entries'][0]
+    print(video["title"])
+    print(video["url"])
+
+    get_random_song()

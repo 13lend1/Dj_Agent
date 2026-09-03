@@ -8,14 +8,15 @@ import termios
 import tty
 import select
 import time
-from songs import get_random_song
+from songs import get_random_song,save
+from audio_metrics import AudioFeatureExtractor
 
 
 class Player:
 
     def __init__(self):
         self.song_queue = queue.Queue(maxsize=2)
-
+        self.save_queue = queue.Queue()
         self.stop_event = threading.Event()
         self.skip_event = threading.Event()
         self.current_length = None
@@ -24,6 +25,19 @@ class Player:
         self.current_url = None
         self.current_rating = None
         self.lock = threading.Lock()
+
+        threading.Thread(target=self._save_worker, daemon=True).start()
+
+    def _save_worker(self):
+        extractor = AudioFeatureExtractor()   # loaded ONCE, ever
+        while True:
+            song = self.save_queue.get()
+            if song is None:
+                break
+            try:
+                save(song, extractor)
+            except Exception as e:
+                print("Save error:", e)
 
     def skip(self):
         self.skip_event.set()
@@ -70,10 +84,8 @@ class Player:
         try:
             process = self.prepare_song(song_info['url'])
             self.song_queue.put({
+                **song_info,
                 'process': process,
-                'url': song_info['url'],
-                'title': song_info['title'],
-                'length': song_info['length']
             })
             print(f"Preloaded: {song_info['title']}")
         except Exception as e:
@@ -81,32 +93,33 @@ class Player:
                         
     def start_preload(self, get_next_song):
 
-        next_url = get_next_song()
+        if self.stop_event.is_set():
+            return
+
+        next_song = get_next_song()
+
+        if self.stop_event.is_set():
+            return
 
         threading.Thread(
             target=self.preload,
-            args=(next_url,),
+            args=(next_song,),
             daemon=True
         ).start()
 
 
-    def get_preloaded_song(self):
-
-        while not self.stop_event.is_set():
-
-            try:
-                return self.song_queue.get(timeout=0.1)
-
-            except queue.Empty:
-                continue
-
-        return None
+    def get_preloaded_song(self, timeout=10):
+        try:
+            return self.song_queue.get(timeout=timeout)
+        except queue.Empty:
+            return None
 
     def play(self, first_song, get_next_song):
 
         current = self.prepare_song(first_song['url'])
         with self.lock:
             self.current_process = current
+            self.current_song = first_song
             self.current_url = first_song['url']
             self.current_title = first_song['title']
             self.current_length = first_song['length']
@@ -145,6 +158,8 @@ class Player:
                         current_song = self.get_preloaded_song()
 
                         if current_song is None:
+                            print("No preloaded song available.")
+                            self.stop()
                             break
 
                         current = current_song['process']
@@ -152,6 +167,7 @@ class Player:
                         with self.lock:
                             self.current_process = current
                             self.current_url = current_song['url']
+                            self.current_song = current_song
                             self.current_title = current_song['title']
                             self.current_length = current_song['length']
                             self.current_start_time = time.time()
@@ -186,6 +202,7 @@ class Player:
                         with self.lock:
                             self.current_process = current
                             self.current_url = current_song['url']
+                            self.current_song = current_song
                             self.current_title = current_song['title']
                             self.current_length = current_song['length']
                             self.current_start_time = time.time()
@@ -260,21 +277,23 @@ class Player:
         print(f"Rating queued for '{title}': {score}")
     def _score_current_song(self):
         with self.lock:
-            title = self.current_title
-            length_ms = self.current_length
-            start_time = self.current_start_time
+            song = dict(self.current_song)
+            seconds_listened = self.current_elapsed
             score = self.current_rating
 
-        if score is None or not length_ms:
+        if not song.get('length'):
             return
 
-        seconds_listened = time.time() - start_time
-        listen_fraction = min(seconds_listened / (length_ms / 1000), 1.0)
-        rating = score / 9
+        listen_fraction = min(seconds_listened / (song['length'] / 1000), 1.0)
 
-        likeability = listen_fraction * rating
-        print(f"'{title}' likeability: {round(likeability, 2)}")
-        
+        if score is not None:
+            likeability = round(score / 9,1)
+        else:
+            likeability = listen_fraction
+
+        print(f"'{song['title']}' likeability: {round(likeability, 2)}")
+        song['score'] = likeability
+        self.save_queue.put(song)
     def keyboard_control(self):
 
         fd = sys.stdin.fileno()

@@ -2,54 +2,14 @@ import musicbrainzngs
 import random
 import yt_dlp
 import sqlite3
-# from audio_metrics import AudioFeatureExtractor,download_audio_to_tempfile,process_track
-
-
-def get_new_songs(songs):
-    conn = sqlite3.connect("music.db")
-    cursor = conn.cursor()
-
-    song_ids = [song["id"] for song in songs]
-
-    if not song_ids:
-        conn.close()
-        return []
-
-    placeholders = ",".join("?" * len(song_ids))
-
-    cursor.execute(
-        f"SELECT id FROM Classical WHERE id IN ({placeholders})",
-        song_ids
-    )
-
-    existing_ids = {row[0] for row in cursor.fetchall()}
-
-    conn.close()
-
-    return [song for song in songs if song["id"] not in existing_ids]
-
-def save(song,genre):
-    conn=sqlite3.connect()
-    cursor=conn.cursor()
-    with yt_dlp.YoutubeDL(options) as ydl:
-            result=ydl.extract_info(f"ytsearch:{title}",
-                                download=False)
-    video=result['entries'][0]
-    # extractor = AudioFeatureExtractor()
-    # features = process_track(video['url'], extractor)
-    
-    
-    # cursor.execute(f"INSERT INTO {genre}(id,name,artist,album,genre,year,link,duration,bpm,energy,danceability,valence,acousticness,instrumentalness,likeability)VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",(song['id'],song['title'],song['artist-credit-phrase'],None,genre,None,video['url'],song['length'],features['bpm'],features['energy'],features['danceability'],features['valence'],features['acousticness'],features['instrumentalness']))
+from audio_metrics import process_track
 
 # extractor = AudioFeatureExtractor()
 # features = process_track(video['url'], extractor)
 # print(features)
 
-import musicbrainzngs
-import yt_dlp
-import random
 
-GENRES = ["house", "techno", "jazz", "rock", "hip hop", "pop", "reggae", "funk", "soul", "disco"]
+GENRES = ["house", "techno", "jazz", "rock", "hip hop", "pop", "reggae", "funk", "soul", "disco","classic","Latin","edm","jazz"]
 
 musicbrainzngs.set_useragent("DjAgent", "1.0.0", "https://github.com/13lend1")
 
@@ -79,6 +39,7 @@ def _fetch_random_song():
         return None
 
     song = random.choice(recordings)
+    id=song['id']
     title = song.get('title')
     artist = song.get('artist-credit-phrase')
     length=song.get('length')
@@ -88,8 +49,14 @@ def _fetch_random_song():
 
     release_list = song.get('release-list', [])
     album = None
+    year=None
     if release_list:
-        album = release_list[0].get('release-group', {}).get('title')
+        release = release_list[0]
+        album = release.get('release-group', {}).get('title')
+        date = release.get('date')  # e.g. "1994-11-01" or just "1994"
+        if date:
+            year = date[:4]
+
 
     queries = [f"{title} {artist} {album}"] if album else []
     queries.append(f"{title} {artist}")
@@ -104,9 +71,33 @@ def _fetch_random_song():
 
             entries = result.get('entries', [])
             if entries:
-                return {'url': entries[0]['url'], 'title': title, 'artist': artist, 'genre': genre,'length':length_ms}
-
+                return {'url': entries[0]['url'], 'title': title,'album':album, 'artist': artist, 'genre': genre, 'length': length_ms, 'year': year,'id':id}
     return None
+
+
+def save(song,extractor):
+    conn = sqlite3.connect("Database/music.db") 
+    cursor = conn.cursor()
+    features = process_track(song['url'], extractor)
+
+    cursor.execute(
+        """
+        INSERT INTO Songs
+            (id, name, artist, album, genre, year, link, duration,
+            bpm, energy, danceability, valence, acousticness, instrumentalness, likeability)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET likeability = excluded.likeability
+        """,
+        (
+            song['id'], song['title'], song['artist'], song['album'],
+            song['genre'], song['year'], song['url'], song['length'],
+            features['bpm'], features['energy'], features['danceability'],
+            features['valence'], features['acousticness'], features['instrumentalness'],
+            song['score'],
+        ),
+    )
+    conn.commit()
+    conn.close()
 
 
 if __name__=="__main__":

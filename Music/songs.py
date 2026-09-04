@@ -2,14 +2,14 @@ import musicbrainzngs
 import random
 import yt_dlp
 import sqlite3
-from audio_metrics import process_track
-
-# extractor = AudioFeatureExtractor()
-# features = process_track(video['url'], extractor)
-# print(features)
+from .audio_metrics import AudioFeatureExtractor,process_track
 
 
-GENRES = ["house", "techno", "jazz", "rock", "hip hop", "pop", "reggae", "funk", "soul", "disco","classic","Latin","edm","jazz"]
+GENRES = [
+    "house", "techno", "jazz", "rock", "hip hop", "pop", "reggae", "funk",
+    "soul", "disco", "classical", "latin", "edm", "blues", "country",
+    "metal", "punk", "ambient", "r&b", "indie",
+]
 
 musicbrainzngs.set_useragent("DjAgent", "1.0.0", "https://github.com/13lend1")
 
@@ -74,7 +74,43 @@ def _fetch_random_song():
                 return {'url': entries[0]['url'], 'title': title,'album':album, 'artist': artist, 'genre': genre, 'length': length_ms, 'year': year,'id':id}
     return None
 
-
+def get_random_songs(n=20, max_attempts=5, batch_size=5):
+    """Process songs in batches for better performance."""
+    songs = []
+    seen_ids = set()
+    extractor = AudioFeatureExtractor()
+    
+    # Process in batches
+    while len(songs) < n:
+        batch_songs = []
+        remaining = min(batch_size, n - len(songs))
+        
+        # Collect songs first
+        for _ in range(remaining):
+            song = None
+            for attempt in range(max_attempts):
+                song = _fetch_random_song()
+                if song and song['id'] not in seen_ids:
+                    break
+            if song:
+                seen_ids.add(song['id'])
+                batch_songs.append(song)
+            else:
+                print(f"Failed to fetch song after {max_attempts} attempts")
+        
+        # Process batch
+        for song in batch_songs:
+            try:
+                print(f"Processing: {song['title']} — {song['artist']}...")
+                features = process_track(song['url'], extractor)
+                if features:
+                    song.update(features)
+                    songs.append(song)
+                    print(f"[{len(songs)}/{n}] {song['title']} — {song['artist']} ✓")
+            except Exception as e:
+                print(f"❌ Failed: {song['title']} - {e}")
+    
+    return songs
 def save(song,extractor):
     conn = sqlite3.connect("Database/music.db") 
     cursor = conn.cursor()

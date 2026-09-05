@@ -1,3 +1,5 @@
+import sys, os
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import yt_dlp
 import subprocess
 import sounddevice as sd
@@ -8,9 +10,8 @@ import termios
 import tty
 import select
 import time
-from songs import get_random_song,save
-from audio_metrics import AudioFeatureExtractor
-
+from songs import get_random_song,get_random_songs,save,save_preprocessed,preprocessed_count,get_preprocessed_batch,remove_from_preprocessed
+from Model.linear_regression import LinearRegressionModel
 
 class Player:
 
@@ -19,23 +20,55 @@ class Player:
         self.save_queue = queue.Queue()
         self.stop_event = threading.Event()
         self.skip_event = threading.Event()
+        self.batch_queue = queue.Queue()
+        self.batch_lock = threading.Lock()
+        self.stop_event = threading.Event()
+        self.model = LinearRegressionModel().fit()
         self.current_length = None
         self.current_elapsed = None
         self.current_process = None
         self.current_url = None
         self.current_rating = None
         self.lock = threading.Lock()
+        
 
         threading.Thread(target=self._save_worker, daemon=True).start()
+        threading.Thread(target=self._refill_worker, daemon=True).start()
 
+    def _refill_worker(self, low_water=10, refill_n=20, check_interval=5):
+        while not self.stop_event.is_set():
+            try:
+                if preprocessed_count() < low_water:
+                    get_random_songs(n=refill_n, on_song=save_preprocessed)
+            except Exception as e:
+                print("Refill error:", e)
+            time.sleep(check_interval)
+
+    def get_next_song(self, percent=0.2):
+        with self.batch_lock:
+            if self.batch_queue.empty():
+                top = None
+                try:
+                    top = self.model.predict(top_pct=percent)
+                except Exception as e:
+                    print("Predict unavailable, falling back:", e)
+
+                if top is not None and not top.empty:
+                    songs = top.to_dict('records')
+                    remove_from_preprocessed([s['id'] for s in songs])
+                    for s in songs:
+                        self.batch_queue.put(s)
+
+            if self.batch_queue.empty():
+                return get_random_song()
+            return self.batch_queue.get()
     def _save_worker(self):
-        extractor = AudioFeatureExtractor()   # loaded ONCE, ever
         while True:
             song = self.save_queue.get()
             if song is None:
                 break
             try:
-                save(song, extractor)
+                save(song)
             except Exception as e:
                 print("Save error:", e)
 
@@ -82,12 +115,12 @@ class Player:
             return
 
         try:
-            process = self.prepare_song(song_info['url'])
+            process = self.prepare_song(song_info['link'])
             self.song_queue.put({
                 **song_info,
                 'process': process,
             })
-            print(f"Preloaded: {song_info['title']}")
+            print(f"Preloaded: {song_info['name']}")
         except Exception as e:
             print("Preload error:", e)
                         
@@ -116,13 +149,13 @@ class Player:
 
     def play(self, first_song, get_next_song):
 
-        current = self.prepare_song(first_song['url'])
+        current = self.prepare_song(first_song['link'])
         with self.lock:
             self.current_process = current
             self.current_song = first_song
-            self.current_url = first_song['url']
-            self.current_title = first_song['title']
-            self.current_length = first_song['length']
+            self.current_url = first_song['link']
+            self.current_title = first_song['name']
+            self.current_length = first_song['duration']
             self.current_start_time = time.time()
         # Preload next song
         print(f"Now playing: {self.current_title}")
@@ -166,10 +199,10 @@ class Player:
 
                         with self.lock:
                             self.current_process = current
-                            self.current_url = current_song['url']
+                            self.current_url = current_song['link']
                             self.current_song = current_song
-                            self.current_title = current_song['title']
-                            self.current_length = current_song['length']
+                            self.current_title = current_song['name']
+                            self.current_length = current_song['duration']
                             self.current_start_time = time.time()
                             self.current_rating = None
 
@@ -201,14 +234,14 @@ class Player:
 
                         with self.lock:
                             self.current_process = current
-                            self.current_url = current_song['url']
+                            self.current_url = current_song['link']
                             self.current_song = current_song
-                            self.current_title = current_song['title']
-                            self.current_length = current_song['length']
+                            self.current_title = current_song['name']
+                            self.current_length = current_song['duration']
                             self.current_start_time = time.time()
                             self.current_rating = None
 
-                        print(f"\nNow playing: {current_song['title']}")
+                        print(f"\nNow playing: {current_song['name']}")
                         self.start_preload(get_next_song)
                         continue
 
@@ -281,17 +314,17 @@ class Player:
             seconds_listened = self.current_elapsed
             score = self.current_rating
 
-        if not song.get('length'):
+        if not song.get('duration'):
             return
 
-        listen_fraction = min(seconds_listened / (song['length'] / 1000), 1.0)
+        listen_fraction = min(seconds_listened / (song['duration'] / 1000), 1.0)
 
         if score is not None:
             likeability = round(score / 9,1)
         else:
             likeability = listen_fraction
 
-        print(f"'{song['title']}' likeability: {round(likeability, 2)}")
+        print(f"'{song['name']}' likeability: {round(likeability, 2)}")
         song['score'] = likeability
         self.save_queue.put(song)
     def keyboard_control(self):
@@ -341,15 +374,7 @@ class Player:
             
     
 
-
+get_random_songs(n=50, on_song=save_preprocessed)
 dj = Player()
-
-first_song = get_random_song()
-
-dj.start(first_song, get_random_song)
-try:
-    dj.player_thread.join()
-
-except KeyboardInterrupt:
-    dj.stop()
-    dj.player_thread.join()
+first_song = dj.get_next_song()
+dj.start(first_song, dj.get_next_song)

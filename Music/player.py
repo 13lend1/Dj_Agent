@@ -13,6 +13,8 @@ from songs import (
     get_random_songs,
     save,
     save_preprocessed,
+    save_song_metadata,
+    delete_unscored_songs,
     preprocessed_count,
     take_preprocessed_batch,
 )
@@ -21,7 +23,7 @@ from Model.linear_regression import LinearRegressionModel
 
 class Player:
 
-    def __init__(self, pool_size=100, top_n=20):
+    def __init__(self, pool_size=20, top_n=8):
         self.song_queue = queue.Queue(maxsize=2)
         self.save_queue = queue.Queue()
         self.stop_event = threading.Event()
@@ -76,13 +78,14 @@ class Player:
                 while preprocessed_count() < self.pool_size and not self.stop_event.is_set():
                     count = preprocessed_count()
                     now = time.time()
-                    if now - last_print >= 15:
-                        print(f"Refilling candidate pool... ({count}/{self.pool_size} in Preprocessed)")
+                    # quiet until the pool is genuinely empty; the refill worker
+                    # is the one fetching, so prefer to stay silent while it works
+                    if count == 0 and now - last_print >= 15:
+                        print("Waiting for the first candidates... (pool is empty)")
                         last_print = now
-                    # don't wait forever for a full pool: start a smaller
-                    # batch once it has enough songs to score meaningfully
-                    
-                    if now - wait_start > 180 and count >= 10:
+                    # don't wait forever: start a smaller batch once it has enough
+                    # songs to score meaningfully
+                    if now - wait_start > 60 and count >= 6:
                         break
                     time.sleep(check_interval)
 
@@ -101,6 +104,12 @@ class Player:
         if not candidates:
             return
 
+        # training table holds only songs with a meaningful target
+        try:
+            delete_unscored_songs()
+        except Exception as e:
+            print("Cleanup failed:", e)
+
         try:
             self.model.fit()
             top = self.model.select_best(candidates, n=self.top_n)
@@ -109,20 +118,19 @@ class Player:
             print("Scoring unavailable, selecting randomly instead:", e)
             records = random.sample(candidates, min(self.top_n, len(candidates)))
 
-        new_batch = []
+        # Write the model *prediction* as likeability only for the n best —
+        # the real score overwrites it when the song is actually played
+        # (_score_current_song -> save()). Never persist NULL-likeability rows.
         for song in records:
-            predicted = song.get('likeability')
-            if predicted is not None:
-                song['score'] = round(float(predicted), 4)
+            if 'likeability' in song and song['likeability'] is not None:
                 try:
-                    save(song)  # land in Songs with the predicted likeability
+                    save_song_metadata(song, likeability=song['likeability'])
                 except Exception as e:
                     print("Save predicted likeability failed:", e)
-            new_batch.append(song)
 
         with self.batch_lock:
-            self.batch.extend(new_batch)
-        print(f"Queued batch of {len(new_batch)} songs (predicted likeability).")
+            self.batch.extend(records)
+        print(f"Queued batch of {len(records)} songs — predicted likeability saved (pool {self.pool_size}, best {self.top_n}).")
 
     def get_next_song(self):
         while not self.stop_event.is_set():
@@ -405,7 +413,7 @@ class Player:
         listen_fraction = min(seconds_listened / (song['duration'] / 1000), 1.0)
 
         if score is not None:
-            likeability = round(score / 9, 1)
+            likeability = round(score / 9, 2)
         else:
             likeability = listen_fraction
 
@@ -476,7 +484,7 @@ class Player:
 
 
 if __name__ == "__main__":
-    dj = Player(pool_size=100, top_n=20)
+    dj = Player(pool_size=20, top_n=8)
     print("Looking for the first batch of songs to play...")
     first_song = dj.get_next_song()
     dj.start(first_song, dj.get_next_song)

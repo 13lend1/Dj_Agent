@@ -1,67 +1,137 @@
 import sys, os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import random
+import queue
+import threading
+import time
 import yt_dlp
 import subprocess
 import sounddevice as sd
-import threading
-import queue
-import sys
-import termios
-import tty
-import select
-import time
-from songs import get_random_song,get_random_songs,save,save_preprocessed,preprocessed_count,get_preprocessed_batch,remove_from_preprocessed
+import traceback
+from songs import (
+    get_random_song,
+    get_random_songs,
+    save,
+    save_preprocessed,
+    preprocessed_count,
+    take_preprocessed_batch,
+)
 from Model.linear_regression import LinearRegressionModel
+
 
 class Player:
 
-    def __init__(self):
+    def __init__(self, pool_size=100, top_n=20):
         self.song_queue = queue.Queue(maxsize=2)
         self.save_queue = queue.Queue()
         self.stop_event = threading.Event()
         self.skip_event = threading.Event()
-        self.batch_queue = queue.Queue()
+        self.batch = []
         self.batch_lock = threading.Lock()
-        self.stop_event = threading.Event()
-        self.model = LinearRegressionModel().fit()
+        self.model = LinearRegressionModel()
+        self.pool_size = pool_size
+        self.top_n = top_n
         self.current_length = None
         self.current_elapsed = None
         self.current_process = None
         self.current_url = None
         self.current_rating = None
         self.lock = threading.Lock()
-        
 
         threading.Thread(target=self._save_worker, daemon=True).start()
         threading.Thread(target=self._refill_worker, daemon=True).start()
+        threading.Thread(target=self._batch_worker, daemon=True).start()
 
-    def _refill_worker(self, low_water=10, refill_n=20, check_interval=5):
+    def _refill_worker(self, low_water=None, refill_n=None, check_interval=5):
+        # keeps the Preprocessed table topped up so there is always a fresh
+        # ~pool_size candidate pool waiting for the next scored batch
+        if low_water is None:
+            low_water = self.pool_size
+        if refill_n is None:
+            refill_n = self.pool_size
         while not self.stop_event.is_set():
             try:
                 if preprocessed_count() < low_water:
                     get_random_songs(n=refill_n, on_song=save_preprocessed)
             except Exception as e:
-                print("Refill error:", e)
+                print("Refill error:")
+                traceback.print_exc()
             time.sleep(check_interval)
 
-    def get_next_song(self, percent=0.2):
-        with self.batch_lock:
-            if self.batch_queue.empty():
-                top = None
+    def _batch_worker(self, check_interval=2):
+        # keeps the play queue fed: takes a full Preprocessed batch (~pool_size),
+        # scores it with the linear regression model, keeps the best top_n,
+        # saves those with predicted likeability, and chains into the next batch
+        while not self.stop_event.is_set():
+            try:
+                with self.batch_lock:
+                    queued = len(self.batch)
+                if queued >= self.top_n - 5:
+                    time.sleep(check_interval)
+                    continue
+
+                wait_start = time.time()
+                last_print = 0
+
+                while preprocessed_count() < self.pool_size and not self.stop_event.is_set():
+                    count = preprocessed_count()
+                    now = time.time()
+                    if now - last_print >= 15:
+                        print(f"Refilling candidate pool... ({count}/{self.pool_size} in Preprocessed)")
+                        last_print = now
+                    # don't wait forever for a full pool: start a smaller
+                    # batch once it has enough songs to score meaningfully
+                    
+                    if now - wait_start > 180 and count >= 10:
+                        break
+                    time.sleep(check_interval)
+
+                if self.stop_event.is_set():
+                    return
+
+                self._fetch_batch()
+            except Exception as e:
+                print("Batch error:")
+                traceback.print_exc()
+                time.sleep(check_interval)
+
+    def _fetch_batch(self):
+        # delete the whole pool (~pool_size) out of Preprocessed, then pick the best
+        candidates = take_preprocessed_batch(n=self.pool_size)
+        if not candidates:
+            return
+
+        try:
+            self.model.fit()
+            top = self.model.select_best(candidates, n=self.top_n)
+            records = top.to_dict('records')
+        except Exception as e:
+            print("Scoring unavailable, selecting randomly instead:", e)
+            records = random.sample(candidates, min(self.top_n, len(candidates)))
+
+        new_batch = []
+        for song in records:
+            predicted = song.get('likeability')
+            if predicted is not None:
+                song['score'] = round(float(predicted), 4)
                 try:
-                    top = self.model.predict(top_pct=percent)
+                    save(song)  # land in Songs with the predicted likeability
                 except Exception as e:
-                    print("Predict unavailable, falling back:", e)
+                    print("Save predicted likeability failed:", e)
+            new_batch.append(song)
 
-                if top is not None and not top.empty:
-                    songs = top.to_dict('records')
-                    remove_from_preprocessed([s['id'] for s in songs])
-                    for s in songs:
-                        self.batch_queue.put(s)
+        with self.batch_lock:
+            self.batch.extend(new_batch)
+        print(f"Queued batch of {len(new_batch)} songs (predicted likeability).")
 
-            if self.batch_queue.empty():
-                return get_random_song()
-            return self.batch_queue.get()
+    def get_next_song(self):
+        while not self.stop_event.is_set():
+            with self.batch_lock:
+                if self.batch:
+                    return self.batch.pop(0)
+            time.sleep(0.5)
+        return None
+
     def _save_worker(self):
         while True:
             song = self.save_queue.get()
@@ -81,7 +151,6 @@ class Player:
             'format': 'bestaudio/best',
             'quiet': True,
             'noplaylist': True,
-            # 'js_runtimes': {'deno': None} 
         }
 
         with yt_dlp.YoutubeDL(options) as ydl:
@@ -123,7 +192,7 @@ class Player:
             print(f"Preloaded: {song_info['name']}")
         except Exception as e:
             print("Preload error:", e)
-                        
+
     def start_preload(self, get_next_song):
 
         if self.stop_event.is_set():
@@ -139,7 +208,6 @@ class Player:
             args=(next_song,),
             daemon=True
         ).start()
-
 
     def get_preloaded_song(self, timeout=10):
         try:
@@ -176,7 +244,7 @@ class Player:
             ) as stream:
 
                 while not self.stop_event.is_set():
-                    
+
                     if self.skip_event.is_set():
 
                         self.skip_event.clear()
@@ -215,7 +283,7 @@ class Player:
                     )
 
                     # Song ended
-                    
+
                     if not data:
 
                         with self.lock:
@@ -256,16 +324,20 @@ class Player:
             except:
                 pass
 
+    def start(self, first_song, get_next_song):
 
-    def start(self, first_url, get_next_song):
-        
-        while(first_url==None):
-            first_url=get_random_song()
-            
+        while first_song is None:
+            if self.stop_event.is_set():
+                return None
+            first_song = get_next_song()
+
+        if self.stop_event.is_set():
+            return None
+
         self.player_thread = threading.Thread(
             target=self.play,
-            args=(first_url, get_next_song),
-            daemon=False
+            args=(first_song, get_next_song),
+            daemon=True
         )
 
         self.player_thread.start()
@@ -292,13 +364,25 @@ class Player:
                     self.current_process.kill()
                 except:
                     pass
+                try:
+                    self.current_process.stdout.close()
+                except:
+                    pass
 
         while not self.song_queue.empty():
             try:
                 song_info = self.song_queue.get_nowait()
-                song_info['process'].kill()
+                try:
+                    song_info['process'].kill()
+                except:
+                    pass
+                try:
+                    song_info['process'].stdout.close()
+                except:
+                    pass
             except queue.Empty:
                 break
+
     def rate_current(self, score):
         with self.lock:
             if not self.current_url:
@@ -308,6 +392,7 @@ class Player:
             title = self.current_title
 
         print(f"Rating queued for '{title}': {score}")
+
     def _score_current_song(self):
         with self.lock:
             song = dict(self.current_song)
@@ -320,33 +405,49 @@ class Player:
         listen_fraction = min(seconds_listened / (song['duration'] / 1000), 1.0)
 
         if score is not None:
-            likeability = round(score / 9,1)
+            likeability = round(score / 9, 1)
         else:
             likeability = listen_fraction
 
         print(f"'{song['name']}' likeability: {round(likeability, 2)}")
         song['score'] = likeability
         self.save_queue.put(song)
+
     def keyboard_control(self):
+        is_windows = sys.platform.startswith('win')
 
-        fd = sys.stdin.fileno()
+        if is_windows:
+            import msvcrt
+        else:
+            import termios
+            import tty
+            import select
 
-        old_settings = termios.tcgetattr(fd)
+            fd = sys.stdin.fileno()
+            old_settings = termios.tcgetattr(fd)
+
+        print("n = next | s = stop | 0-9 = rate song (0.0-1.0)")
 
         try:
-            tty.setcbreak(fd)
-            
-            print("n = next | s = stop | 0-9 = rate song (0.0-1.0)")
+            if not is_windows:
+                tty.setcbreak(fd)
 
             while not self.stop_event.is_set():
 
-                # Check whether a key has been pressed
-                ready, _, _ = select.select([sys.stdin], [], [], 0.1)
+                if is_windows:
+                    if msvcrt.kbhit():
+                        key = msvcrt.getwch().lower()
+                    else:
+                        time.sleep(0.05)
+                        continue
+                else:
+                    # Check whether a key has been pressed
+                    ready, _, _ = select.select([sys.stdin], [], [], 0.1)
 
-                if not ready:
-                    continue
+                    if not ready:
+                        continue
 
-                key = sys.stdin.read(1).lower()
+                    key = sys.stdin.read(1).lower()
 
                 if key == 'n':
                     print("\nSkipping...")
@@ -356,25 +457,33 @@ class Player:
                     print("\nStopping...")
                     self.stop()
 
-                elif key.isdigit():
-                    score=int(key)
-                    self.rate_current(score)
-                
                 elif key == '\x03':  # Ctrl+C
                     print("\nStopping...")
                     self.stop()
 
-        finally:
-            # ALWAYS restore normal terminal behaviour
-            termios.tcsetattr(
-                fd,
-                termios.TCSADRAIN,
-                old_settings
-            )
-            
-    
+                elif key.isdigit():
+                    score = int(key)
+                    self.rate_current(score)
 
-get_random_songs(n=50, on_song=save_preprocessed)
-dj = Player()
-first_song = dj.get_next_song()
-dj.start(first_song, dj.get_next_song)
+        finally:
+            # ALWAYS restore normal terminal behaviour (Unix only)
+            if not is_windows:
+                termios.tcsetattr(
+                    fd,
+                    termios.TCSADRAIN,
+                    old_settings
+                )
+
+
+if __name__ == "__main__":
+    dj = Player(pool_size=100, top_n=20)
+    print("Looking for the first batch of songs to play...")
+    first_song = dj.get_next_song()
+    dj.start(first_song, dj.get_next_song)
+    try:
+        while dj.player_thread.is_alive():
+            time.sleep(0.2)
+    except KeyboardInterrupt:
+        dj.stop()
+    finally:
+        dj.stop()

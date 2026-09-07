@@ -34,6 +34,42 @@ GENRES = [
     "soul", "disco", "classical", "latin", "edm", "blues", "country",
     "metal", "punk", "ambient", "r&b", "indie",'rap'
 ]
+ARTISTS = {
+    "Drake": "hip-hop", "Kendrick Lamar": "hip-hop", "Kanye West": "hip-hop",
+    "Jay-Z": "hip-hop", "50 Cent": "hip-hop", "Snoop Dogg": "hip-hop",
+    "Dr. Dre": "hip-hop", "Eminem": "hip-hop", "Post Malone": "hip-hop",
+    "Travis Scott": "hip-hop", "Mac Miller": "hip-hop", "Kid Cudi": "hip-hop",
+    "Cardi B": "hip-hop", "Megan Thee Stallion": "hip-hop",
+
+    "Taylor Swift": "pop", "Ariana Grande": "pop", "Dua Lipa": "pop",
+    "Ed Sheeran": "pop", "Billie Eilish": "pop", "Justin Bieber": "pop",
+    "Adele": "pop", "Sam Smith": "pop", "Lady Gaga": "pop", "Bruno Mars": "pop",
+
+    "The Weeknd": "r&b", "Rihanna": "r&b", "Frank Ocean": "r&b",
+    "SZA": "r&b", "Doja Cat": "r&b",
+
+    "Calvin Harris": "edm", "David Guetta": "edm", "Tiësto": "edm",
+    "Avicii": "edm", "Deadmau5": "edm", "Skrillex": "edm", "Marshmello": "edm",
+    "Daft Punk": "edm",
+
+    "Metallica": "metal", "Nirvana": "rock", "Foo Fighters": "rock",
+    "Red Hot Chili Peppers": "rock", "Radiohead": "rock", "The Beatles": "rock",
+    "Queen": "rock", "Led Zeppelin": "rock", "Pink Floyd": "rock", "AC/DC": "rock",
+    "Arctic Monkeys": "indie", "The Strokes": "indie", "Tame Impala": "indie",
+
+    "Miles Davis": "jazz", "John Coltrane": "jazz", "Louis Armstrong": "jazz",
+    "Ella Fitzgerald": "jazz", "Nina Simone": "jazz",
+
+    "Bob Marley": "reggae", "Fela Kuti": "funk", "Toots and the Maytals": "reggae",
+    "Stevie Wonder": "soul", "Marvin Gaye": "soul", "Aretha Franklin": "soul",
+    "James Brown": "funk", "Earth, Wind & Fire": "funk",
+
+    "Daddy Yankee": "latin", "Shakira": "latin", "J Balvin": "latin",
+    "Karol G": "latin", "Rosalía": "latin",
+
+    "Frédéric Chopin": "classical", "Ludwig van Beethoven": "classical",
+    "Wolfgang Amadeus Mozart": "classical", "Johann Sebastian Bach": "classical",
+}
 
 
 # canonical database lives in the project's Database/ folder on all OSes
@@ -59,15 +95,15 @@ def get_random_song(max_attempts=5):
     return None
 
 
-def _mb_search(genre, attempts=3):
-    """MusicBrainz recording search with retry/backoff. Returns a result dict
-    or None if the API is unreachable (fixes the WinError 10054 'connection
-    forcibly closed' failures instead of letting them kill the refill)."""
+def _mb_search(query, attempts=3):
+    """MusicBrainz recording search with retry/backoff. `query` is a full
+    Lucene query string (e.g. 'tag:house' or 'artist:"Drake"'). Returns a
+    result dict or None if the API is unreachable."""
     last = None
     for attempt in range(1, attempts + 1):
         try:
-            return musicbrainzngs.search_recordings(query=f"tag:{genre}", limit=100)
-        except Exception as e:  # WebServiceError + urllib/socket errors
+            return musicbrainzngs.search_recordings(query=query, limit=100)
+        except Exception as e:
             last = e
             print(f"MusicBrainz error (attempt {attempt}/{attempts}): {e}")
             time.sleep(1 + attempt * 2)
@@ -81,19 +117,25 @@ def _mb_search(genre, attempts=3):
 MB_LOCK = threading.Lock()
 _MB_CANDIDATES = collections.deque()
 
-
-def _refill_queue():
-    """Pulls fresh recording batches for 3 random genres and mixes them into
-    the shared queue. A full refill therefore spans several genres instead of
-    draining 100 songs of one tag (which made whole pools one genre)."""
-    genres = random.sample(GENRES, k=min(3, len(GENRES)))
+def _refill_queue(used_artists=(), used_genres=()):
+    # Always run an artist query (plus a tag query) so named artists from the
+    # ARTISTS dict get real airtime instead of being drowned by tag results.
+    specs = _random_query_specs(2, used_artists=used_artists, used_genres=used_genres)
     got_any = False
-    for genre in genres:
-        result = _mb_search(genre)
+    for kind, value, genre in specs:
+        result = _mb_search(_mb_query_string(kind, value))
         if not (result and isinstance(result, dict) and result.get("recording-list")):
             continue
         got_any = True
-        for rec in result["recording-list"]:
+
+        recordings = result["recording-list"]
+        if kind == "artist":
+            # an artist query returns ~100 tracks by the SAME artist — keep a
+            # few so the artist actually surfaces, while the per-artist cap in
+            # get_random_songs still stops the batch from flooding
+            recordings = random.sample(recordings, k=min(3, len(recordings)))
+
+        for rec in recordings:
             title = rec.get('title')
             artist = rec.get('artist-credit-phrase')
             if not title or not artist:
@@ -115,29 +157,65 @@ def _refill_queue():
                 'year': year,
                 'duration': int(length) if length and length.isdigit() else None,
                 'genre': genre,
+                'source': 'artist' if kind == "artist" else 'tag',
             })
     if got_any:
         random.shuffle(_MB_CANDIDATES)
         return True
     return False
 
+def _random_query_specs(k=3, used_artists=(), used_genres=()):
+    """Samples k (kind, value, genre) triples so a refill batch mixes tag- and
+    artist-based discovery, preferring genres/artists that aren't already
+    saturated in the current batch. Fresh genres and artists are preferred so
+    the pool doesn't flood with one act or one sound."""
+    g_pool = [("genre", g, g) for g in GENRES if g not in used_genres]
+    a_pool = [("artist", a, g) for a, g in ARTISTS.items() if a not in used_artists]
+    if len(g_pool) < k // 2:
+        g_pool = [("genre", g, g) for g in GENRES]
+    if len(a_pool) < k - k // 2:
+        a_pool = [("artist", a, g) for a, g in ARTISTS.items()]
+    if k == 1:
+        # single query: flip a coin between a random genre and a random artist
+        if random.random() < 0.5:
+            return [random.choice(g_pool)] if g_pool else [random.choice(a_pool)]
+        return [random.choice(a_pool)] if a_pool else [random.choice(g_pool)]
+    n_g = min(len(g_pool), k - k // 2)
+    specs = random.sample(g_pool, k=n_g) + random.sample(a_pool, k=k - n_g)
+    random.shuffle(specs)
+    return specs if specs else [("genre", random.choice(GENRES), random.choice(GENRES))]
 
-def _next_candidate():
-    """Hands a worker one discovery candidate. Pulls a fresh mixed-genre batch
-    from MusicBrainz when the queue is empty (serialized), or falls back
-    directly to YTMusic when MusicBrainz is unreachable."""
+
+def _mb_query_string(kind, value):
+    if kind == "artist":
+        return f'artist:"{value}"'
+    return f"tag:{value}"
+
+def _next_candidate(used_artists=(), used_genres=()):
     with MB_LOCK:
-        if _MB_CANDIDATES:
-            return _MB_CANDIDATES.popleft()
+        while True:
+            if _MB_CANDIDATES:
+                cand = _MB_CANDIDATES.popleft()
+                # Named artists are only capped per-artist; the genre cap must
+                # not wash them out once their genre (pop, hip-hop, ...) is
+                # saturated by tag-based tracks. Tag-sourced tracks still
+                # respect the genre cap.
+                if cand['artist'] in used_artists:
+                    continue
+                if cand.get('source') != 'artist' and cand['genre'] in used_genres:
+                    continue
+                return cand
 
-        if _refill_queue():
-            return _MB_CANDIDATES.popleft()
+            if _refill_queue(used_artists=used_artists, used_genres=used_genres):
+                continue  # loop pops the freshly queued candidate
 
-        # MusicBrainz is down/empty — YTMusic-only fallback (already has a link)
-        song = _yt_fallback(random.choice(GENRES))
-        return song
-
-
+            kind, value, genre = random.choice(_random_query_specs(
+                k=1, used_artists=used_artists, used_genres=used_genres))
+            song = _yt_fallback(value, genre)
+            if song is not None:
+                song['source'] = 'artist' if kind == "artist" else 'tag'
+            return song
+    
 def _parse_duration(dur):
     """Converts YTMusic's 'm:ss' or 'h:mm:ss' strings into milliseconds."""
     if not dur:
@@ -153,16 +231,32 @@ def _parse_duration(dur):
     return None
 
 
-def _best_match(results, title):
-    """Picks the search result whose title shares the most words with the
-    expected one (case/punctuation-insensitive). Always returns something."""
-    wanted = set(re.sub(r'[^a-z0-9 ]', ' ', title.lower()).split())
-    best, best_score = results[0], -1
+def _best_match(results, title, artist=None):
+    """Picks the search result that best matches the expected song. Scores on
+    both title and artist word overlap (case/punctuation-insensitive), so a
+    cover or a same-named song by a different artist loses to the real one.
+    Returns None if nothing matches well enough, so a wrong link is never
+    returned."""
+    wanted_title = set(re.sub(r'[^a-z0-9 ]', ' ', title.lower()).split())
+    wanted_artist = set(re.sub(r'[^a-z0-9 ]', ' ', (artist or '').lower()).split())
+    best, best_score = None, 0.0
+    best_title_score = 0.0
     for v in results:
-        tokens = set(re.sub(r'[^a-z0-9 ]', ' ', (v.get('title') or '')).lower().split())
-        score = len(wanted.intersection(tokens))
+        v_title = set(re.sub(r'[^a-z0-9 ]', ' ', (v.get('title') or '').lower()).split())
+        v_artist = set()
+        for a in (v.get('artists') or []):
+            v_artist |= set(re.sub(r'[^a-z0-9 ]', ' ', (a.get('name') or '').lower()).split())
+        if not wanted_title or not v_title:
+            continue
+        title_score = len(wanted_title.intersection(v_title)) / len(wanted_title)
+        artist_score = (len(wanted_artist.intersection(v_artist)) / len(wanted_artist)
+                        if wanted_artist and v_artist else 0.0)
+        score = title_score + 0.6 * artist_score
         if score > best_score:
-            best_score, best = score, v
+            best_score, best, best_title_score = score, v, title_score
+    # Must match the title well and, when we know the artist, agree on it too.
+    if best is None or best_score < 0.7 or (artist and best_title_score <= 0.5):
+        return None
     return best
 
 
@@ -176,17 +270,15 @@ def _yt_search_link(title, artist, max_results=10):
         return None
     if not results:
         return None
-    video = _best_match(results, title)
+    video = _best_match(results, title, artist)
     if not video or not video.get('videoId'):
         return None
     return f"https://music.youtube.com/watch?v={video['videoId']}"
 
 
-def _yt_fallback(genre):
-    """When MusicBrainz is down: pick a random track straight from YTMusic,
-    no external metadata service required."""
+def _yt_fallback(term, genre):
     try:
-        results = _get_yt().search(genre, filter="songs", limit=20)
+        results = _get_yt().search(term, filter="songs", limit=20)
     except Exception as e:
         print("YTMusic fallback search error:", e)
         return None
@@ -208,11 +300,10 @@ def _yt_fallback(genre):
         'year': None,
         'id': video['videoId'],
     }
-
-
+    
 def _fetch_random_song():
-    genre = random.choice(GENRES)
-    result = _mb_search(genre)
+    kind, value, genre = random.choice(_random_query_specs(k=1))
+    result = _mb_search(_mb_query_string(kind, value))
 
     recording = None
     if result and isinstance(result, dict) and result.get("recording-list"):
@@ -237,7 +328,7 @@ def _fetch_random_song():
         if release_list:
             release = release_list[0]
             album = release.get('release-group', {}).get('title')
-            date = release.get('date')  # e.g. "1994-11-01" or just "1994"
+            date = release.get('date')
             if date:
                 year = date[:4]
 
@@ -248,8 +339,7 @@ def _fetch_random_song():
         return {'link': link, 'name': title, 'album': album, 'artist': artist,
                 'genre': genre, 'duration': length_ms, 'year': year, 'id': song_id}
 
-    # MusicBrainz failed -> fall straight back to a YTMusic-only pick
-    song = _yt_fallback(genre)
+    song = _yt_fallback(value, genre)
     if song is None:
         print("Could not find a playable song (MusicBrainz + YTMusic both failed).")
     return song
@@ -295,8 +385,20 @@ def get_random_songs(n=20, max_attempts=5, batch_size=5, on_song=None, workers=3
     got = 0
     state_lock = threading.Lock()
 
+    # Diversity caps: never flood a batch with one artist, and keep any single
+    # genre to at most ~1/4 of the batch so the selection stays varied.
+    artist_max = 1
+    genre_max = max(1, n // 4)
+    artist_count = collections.Counter()
+    genre_count = collections.Counter()
+
+    def _used_sets():
+        return (set(a for a, c in artist_count.items() if c >= artist_max),
+                set(g for g, c in genre_count.items() if c >= genre_max))
+
     def _job(_genre):
-        cand = _next_candidate()
+        used_artists, used_genres = _used_sets()
+        cand = _next_candidate(used_artists=used_artists, used_genres=used_genres)
         if cand is None:
             return None
         return _build_song(cand, max_attempts=max_attempts)
@@ -314,7 +416,13 @@ def get_random_songs(n=20, max_attempts=5, batch_size=5, on_song=None, workers=3
                 with state_lock:
                     if song['id'] in seen:
                         continue
+                    named = song['artist'] in ARTISTS
+                    if artist_count[song['artist']] >= artist_max or \
+                       (not named and genre_count[song['genre']] >= genre_max):
+                        continue  # over a diversity cap — don't count this one
                     seen.add(song['id'])
+                    artist_count[song['artist']] += 1
+                    genre_count[song['genre']] += 1
                     got += 1
                     progress = got
                 print(f"[{progress}/{n}] {song['name']} - {song['artist']}")

@@ -9,3 +9,4 @@ wheels/
 Miniconda3-latest-Linux-x86_64.sh
 # Virtual environments
 .venv
+.env

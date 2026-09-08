@@ -1,38 +1,22 @@
 import sys, os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-import random
 import queue
 import threading
 import time
 import yt_dlp
 import subprocess
 import sounddevice as sd
-import traceback
 from songs import (
-    get_random_song,
-    get_random_songs,
     save,
-    save_preprocessed,
-    save_song_metadata,
-    delete_unscored_songs,
-    preprocessed_count,
-    take_preprocessed_batch,
 )
-from Model.linear_regression import LinearRegressionModel
 
 
 class Player:
 
-    def __init__(self, pool_size=20, top_n=8):
-        self.song_queue = queue.Queue(maxsize=2)
+    def __init__(self):
         self.save_queue = queue.Queue()
         self.stop_event = threading.Event()
         self.skip_event = threading.Event()
-        self.batch = []
-        self.batch_lock = threading.Lock()
-        self.model = LinearRegressionModel()
-        self.pool_size = pool_size
-        self.top_n = top_n
         self.current_length = None
         self.current_elapsed = None
         self.current_process = None
@@ -41,104 +25,6 @@ class Player:
         self.lock = threading.Lock()
 
         threading.Thread(target=self._save_worker, daemon=True).start()
-        threading.Thread(target=self._refill_worker, daemon=True).start()
-        threading.Thread(target=self._batch_worker, daemon=True).start()
-
-    def _refill_worker(self, low_water=None, refill_n=None, check_interval=5):
-        # keeps the Preprocessed table topped up so there is always a fresh
-        # ~pool_size candidate pool waiting for the next scored batch
-        if low_water is None:
-            low_water = self.pool_size
-        if refill_n is None:
-            refill_n = self.pool_size
-        while not self.stop_event.is_set():
-            try:
-                if preprocessed_count() < low_water:
-                    get_random_songs(n=refill_n, on_song=save_preprocessed)
-            except Exception as e:
-                print("Refill error:")
-                traceback.print_exc()
-            time.sleep(check_interval)
-
-    def _batch_worker(self, check_interval=2):
-        # keeps the play queue fed: takes a full Preprocessed batch (~pool_size),
-        # scores it with the linear regression model, keeps the best top_n,
-        # saves those with predicted likeability, and chains into the next batch
-        while not self.stop_event.is_set():
-            try:
-                with self.batch_lock:
-                    queued = len(self.batch)
-                if queued >= self.top_n - 5:
-                    time.sleep(check_interval)
-                    continue
-
-                wait_start = time.time()
-                last_print = 0
-
-                while preprocessed_count() < self.pool_size and not self.stop_event.is_set():
-                    count = preprocessed_count()
-                    now = time.time()
-                    # quiet until the pool is genuinely empty; the refill worker
-                    # is the one fetching, so prefer to stay silent while it works
-                    if count == 0 and now - last_print >= 15:
-                        print("Waiting for the first candidates... (pool is empty)")
-                        last_print = now
-                    # don't wait forever: start a smaller batch once it has enough
-                    # songs to score meaningfully
-                    if now - wait_start > 60 and count >= 6:
-                        break
-                    time.sleep(check_interval)
-
-                if self.stop_event.is_set():
-                    return
-
-                self._fetch_batch()
-            except Exception as e:
-                print("Batch error:")
-                traceback.print_exc()
-                time.sleep(check_interval)
-
-    def _fetch_batch(self):
-        # delete the whole pool (~pool_size) out of Preprocessed, then pick the best
-        candidates = take_preprocessed_batch(n=self.pool_size)
-        if not candidates:
-            return
-
-        # training table holds only songs with a meaningful target
-        try:
-            delete_unscored_songs()
-        except Exception as e:
-            print("Cleanup failed:", e)
-
-        try:
-            self.model.fit()
-            top = self.model.select_best(candidates, n=self.top_n)
-            records = top.to_dict('records')
-        except Exception as e:
-            print("Scoring unavailable, selecting randomly instead:", e)
-            records = random.sample(candidates, min(self.top_n, len(candidates)))
-
-        # Write the model *prediction* as likeability only for the n best —
-        # the real score overwrites it when the song is actually played
-        # (_score_current_song -> save()). Never persist NULL-likeability rows.
-        for song in records:
-            if 'likeability' in song and song['likeability'] is not None:
-                try:
-                    save_song_metadata(song, likeability=song['likeability'])
-                except Exception as e:
-                    print("Save predicted likeability failed:", e)
-
-        with self.batch_lock:
-            self.batch.extend(records)
-        print(f"Queued batch of {len(records)} songs — predicted likeability saved (pool {self.pool_size}, best {self.top_n}).")
-
-    def get_next_song(self):
-        while not self.stop_event.is_set():
-            with self.batch_lock:
-                if self.batch:
-                    return self.batch.pop(0)
-            time.sleep(0.5)
-        return None
 
     def _save_worker(self):
         while True:
@@ -182,60 +68,20 @@ class Player:
 
         return process
 
-    def preload(self, song_info):
-        if song_info is None:
-            print("No song available to preload, fetching a random one.")
-            song_info = get_random_song()
-
-        if song_info is None:
-            print("Could not find a song to preload.")
-            return
-
-        try:
-            process = self.prepare_song(song_info['link'])
-            self.song_queue.put({
-                **song_info,
-                'process': process,
-            })
-            print(f"Preloaded: {song_info['name']}")
-        except Exception as e:
-            print("Preload error:", e)
-
-    def start_preload(self, get_next_song):
-
-        if self.stop_event.is_set():
-            return
-
-        next_song = get_next_song()
-
-        if self.stop_event.is_set():
-            return
-
-        threading.Thread(
-            target=self.preload,
-            args=(next_song,),
-            daemon=True
-        ).start()
-
-    def get_preloaded_song(self, timeout=10):
-        try:
-            return self.song_queue.get(timeout=timeout)
-        except queue.Empty:
-            return None
-
     def play(self, first_song, get_next_song):
 
-        current = self.prepare_song(first_song['link'])
+        current_song = first_song
+        current = self.prepare_song(current_song['link'])
         with self.lock:
             self.current_process = current
-            self.current_song = first_song
-            self.current_url = first_song['link']
-            self.current_title = first_song['name']
-            self.current_length = first_song['duration']
+            self.current_song = current_song
+            self.current_url = current_song['link']
+            self.current_title = current_song['name']
+            self.current_length = current_song['duration']
             self.current_start_time = time.time()
-        # Preload next song
+            self.current_rating = None
+
         print(f"Now playing: {self.current_title}")
-        self.start_preload(get_next_song)
 
         print("\nDJ started!")
         print("n = next")
@@ -264,14 +110,14 @@ class Player:
 
                         current.kill()
 
-                        current_song = self.get_preloaded_song()
-
-                        if current_song is None:
-                            print("No preloaded song available.")
+                        next_song = get_next_song()
+                        if next_song is None:
+                            print("No more songs available.")
                             self.stop()
                             break
 
-                        current = current_song['process']
+                        current_song = next_song
+                        current = self.prepare_song(current_song['link'])
 
                         with self.lock:
                             self.current_process = current
@@ -282,15 +128,12 @@ class Player:
                             self.current_start_time = time.time()
                             self.current_rating = None
 
-                        print("Starting next song...")
-                        self.start_preload(get_next_song)
+                        print(f"\nNow playing: {self.current_title}")
                         continue
-                    # Read audio
+
                     data = current.stdout.read(
                         4096 * 2 * 2
                     )
-
-                    # Song ended
 
                     if not data:
 
@@ -301,12 +144,12 @@ class Player:
 
                         current.kill()
 
-                        current_song = self.get_preloaded_song()
-
-                        if current_song is None:
+                        next_song = get_next_song()
+                        if next_song is None:
                             break
 
-                        current = current_song['process']
+                        current_song = next_song
+                        current = self.prepare_song(current_song['link'])
 
                         with self.lock:
                             self.current_process = current
@@ -318,7 +161,6 @@ class Player:
                             self.current_rating = None
 
                         print(f"\nNow playing: {current_song['name']}")
-                        self.start_preload(get_next_song)
                         continue
 
                     stream.write(data)
@@ -364,8 +206,6 @@ class Player:
 
         self.stop_event.set()
 
-        # Kill the current FFmpeg process.
-        # This also releases stdout.read() if it is blocked.
         with self.lock:
             if self.current_process:
                 try:
@@ -376,20 +216,6 @@ class Player:
                     self.current_process.stdout.close()
                 except:
                     pass
-
-        while not self.song_queue.empty():
-            try:
-                song_info = self.song_queue.get_nowait()
-                try:
-                    song_info['process'].kill()
-                except:
-                    pass
-                try:
-                    song_info['process'].stdout.close()
-                except:
-                    pass
-            except queue.Empty:
-                break
 
     def rate_current(self, score):
         with self.lock:
@@ -449,7 +275,6 @@ class Player:
                         time.sleep(0.05)
                         continue
                 else:
-                    # Check whether a key has been pressed
                     ready, _, _ = select.select([sys.stdin], [], [], 0.1)
 
                     if not ready:
@@ -474,24 +299,9 @@ class Player:
                     self.rate_current(score)
 
         finally:
-            # ALWAYS restore normal terminal behaviour (Unix only)
             if not is_windows:
                 termios.tcsetattr(
                     fd,
                     termios.TCSADRAIN,
                     old_settings
                 )
-
-
-if __name__ == "__main__":
-    dj = Player(pool_size=20, top_n=8)
-    print("Looking for the first batch of songs to play...")
-    first_song = dj.get_next_song()
-    dj.start(first_song, dj.get_next_song)
-    try:
-        while dj.player_thread.is_alive():
-            time.sleep(0.2)
-    except KeyboardInterrupt:
-        dj.stop()
-    finally:
-        dj.stop()

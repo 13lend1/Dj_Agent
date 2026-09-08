@@ -387,7 +387,7 @@ def get_random_songs(n=20, max_attempts=5, batch_size=5, on_song=None, workers=3
 
     # Diversity caps: never flood a batch with one artist, and keep any single
     # genre to at most ~1/4 of the batch so the selection stays varied.
-    artist_max = 1
+    artist_max = 2
     genre_max = max(1, n // 4)
     artist_count = collections.Counter()
     genre_count = collections.Counter()

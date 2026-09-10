@@ -42,8 +42,6 @@ class DJ(PreloadedPlayer):
     _CHUNK = 4096 * 2 * 2  # 4096 stereo int16 frames
     DEFAULT_TRANSITION = {"type": "crossfade", "crossfade_sec": 2.0, "note": "Default crossfade."}
 
-    # ---- selection: linear model -> Agent (rank + hook windows) ----------
-
     def _fetch_batch(self):
         candidates = take_preprocessed_batch(n=self.pool_size)
         if not candidates:
@@ -259,8 +257,14 @@ class DJ(PreloadedPlayer):
         while not self.stop_event.is_set():
             t = 1.0 if fade_bytes <= 0 else min(written / fade_bytes, 1.0)
 
-            a = out_process.stdout.read(self._CHUNK)
-            b = in_process.stdout.read(self._CHUNK)
+            try:
+                a = out_process.stdout.read(self._CHUNK)
+            except (OSError, ValueError):
+                a = b""
+            try:
+                b = in_process.stdout.read(self._CHUNK)
+            except (OSError, ValueError):
+                b = b""
 
             if not a and not b:
                 break
@@ -288,7 +292,14 @@ class DJ(PreloadedPlayer):
 
     def _advance(self, current, stream, crossfade_sec):
         """Move from the current (outgoing) process into the next: crossfade if
-        requested, then kill the old process and hand the deck to the new song."""
+        requested, then kill the old process and hand the deck to the new song.
+        The outgoing song is remembered as the previously played one."""
+        if self.stop_event.is_set():
+            return None
+
+        with self.lock:
+            outgoing = dict(self.current_song) if self.current_song is not None else None
+
         next_song = self.get_preloaded_song(timeout=20)
         if next_song is None:
             return None
@@ -300,6 +311,7 @@ class DJ(PreloadedPlayer):
         except Exception:
             pass
         self._begin_song(next_song, next_process)
+        self.last_song = outgoing
         return next_song
 
     def play(self, first_song, get_next_song):
@@ -334,9 +346,58 @@ class DJ(PreloadedPlayer):
             print("\nDJ started!")
             print("n = next")
             print("s = stop")
+            print("r = replay the song that played before this one")
+            print("a = restart current song from the beginning")
             print("Ctrl+C = stop\n")
 
             while not self.stop_event.is_set():
+
+                if self.restart_event.is_set():
+
+                    self.restart_event.clear()
+
+                    with self.lock:
+                        song = dict(self.current_song)
+
+                    try:
+                        current.kill()
+                    except Exception:
+                        pass
+
+                    current = self.prepare_song(song)
+
+                    self._begin_song(song, current)
+
+                    print(f"\nRestarting from the beginning: {self.current_title} {self._fmt_hook(song)}",
+                          flush=True)
+                    continue
+
+                if self.replay_event.is_set():
+
+                    self.replay_event.clear()
+
+                    with self.lock:
+                        outgoing = dict(self.current_song) if self.current_song is not None else None
+                        replay_song = dict(self.last_song) if self.last_song else None
+
+                    if replay_song is None:
+                        print("\nNo previous song to replay.")
+                        continue
+
+                    self._score_replay(replay_song)
+
+                    try:
+                        current.kill()
+                    except Exception:
+                        pass
+
+                    current = self.prepare_song(replay_song)
+                    self._begin_song(replay_song, current)
+                    self.last_song = outgoing
+
+                    print(f"\nNow playing (replayed): {self.current_title} {self._fmt_hook(replay_song)}",
+                          flush=True)
+                    continue
 
                 transitions = (
                     (getattr(self, 'current_song', None) or {}).get('transition_out')
@@ -350,13 +411,17 @@ class DJ(PreloadedPlayer):
 
                     self.skip_event.clear()
 
+                    if self.stop_event.is_set():
+                        break
+
                     with self.lock:
                         self.current_elapsed = time.time() - self.current_start_time
 
                     self._score_current_song()
 
-                    if transitions.get('type') != 'cut':
-                        print(f"Crossfading out: {transitions.get('note', '')}")
+                    if not self.replay_event.is_set():
+                        if transitions.get('type') != 'cut':
+                            print(f"Crossfading out: {transitions.get('note', '')}")
 
                     next_song = self._advance(current, stream, crossfade_sec)
 
@@ -375,13 +440,17 @@ class DJ(PreloadedPlayer):
                 elapsed = time.time() - self.current_start_time
                 if clip is not None and elapsed >= max(0.0, clip - crossfade_sec - 0.1):
 
+                    if self.stop_event.is_set():
+                        break
+
                     with self.lock:
                         self.current_elapsed = elapsed
 
                     self._score_current_song()
 
-                    if transitions.get('type') != 'cut':
-                        print(f"\nCrossfading to next: {transitions.get('note', '')}")
+                    if not self.replay_event.is_set():
+                        if transitions.get('type') != 'cut':
+                            print(f"\nCrossfading to next: {transitions.get('note', '')}")
 
                     next_song = self._advance(current, stream, crossfade_sec)
 
@@ -389,7 +458,7 @@ class DJ(PreloadedPlayer):
                         # preload is still warming up / pool refilling: keep the
                         # current song going and retry instead of killing the set
                         self._advance_fail_count += 1
-                        if self._advance_fail_count >= 5:
+                        if self.stop_event.is_set() or self._advance_fail_count >= 5:
                             print("No more songs available — the pool is dry.", flush=True)
                             self.stop()
                             break
@@ -402,9 +471,15 @@ class DJ(PreloadedPlayer):
                     self._keep_preloaded(get_next_song)
                     continue
 
-                data = current.stdout.read(self._CHUNK)
+                try:
+                    data = current.stdout.read(self._CHUNK)
+                except (OSError, ValueError):
+                    data = b""
 
                 if not data:
+
+                    if self.stop_event.is_set():
+                        break
 
                     with self.lock:
                         self.current_elapsed = time.time() - self.current_start_time

@@ -168,6 +168,37 @@ class PreloadedPlayer(Player):
         except queue.Empty:
             return None
 
+    def _settle_next(self, current, get_next_song):
+        """Settle the outgoing song and hand back (song, process) to play next,
+        tracking the outgoing song as the previous one. Returns (None, None)
+        when there is nothing left to play."""
+        with self.lock:
+            self.current_elapsed = time.time() - self.current_start_time
+
+        try:
+            current.kill()
+        except Exception:
+            pass
+
+        self._score_current_song()
+
+        song = self.get_preloaded_song()
+        if song is None:
+            return None, None
+        process = song['process']
+
+        with self.lock:
+            self.last_song = dict(self.current_song) if self.current_song is not None else None
+            self.current_process = process
+            self.current_url = song['link']
+            self.current_song = song
+            self.current_title = song['name']
+            self.current_length = song['duration']
+            self.current_start_time = time.time()
+            self.current_rating = None
+
+        return song, process
+
     def play(self, first_song, get_next_song):
 
         current = self.prepare_song(first_song['link'])
@@ -185,6 +216,8 @@ class PreloadedPlayer(Player):
         print("\nDJ started!")
         print("n = next")
         print("s = stop")
+        print("r = replay the song that played before this one")
+        print("a = restart current song from the beginning")
         print("Ctrl+C = stop\n")
 
         try:
@@ -198,66 +231,90 @@ class PreloadedPlayer(Player):
 
                 while not self.stop_event.is_set():
 
+                    if self.restart_event.is_set():
+
+                        self.restart_event.clear()
+
+                        with self.lock:
+                            song = dict(self.current_song)
+
+                        current.kill()
+
+                        current = self.prepare_song(song['link'])
+
+                        with self.lock:
+                            self.current_process = current
+                            self.current_start_time = time.time()
+                            self.current_elapsed = None
+
+                        print(f"\nRestarting from the beginning: {song['name']}")
+                        continue
+
+                    if self.replay_event.is_set():
+
+                        self.replay_event.clear()
+
+                        with self.lock:
+                            replay_song = dict(self.last_song) if self.last_song else None
+
+                        if replay_song is None:
+                            print("\nNo previous song to replay.")
+                            continue
+
+                        self._score_replay(replay_song)
+
+                        current.kill()
+
+                        current = self.prepare_song(replay_song['link'])
+
+                        with self.lock:
+                            self.last_song = dict(self.current_song) if self.current_song is not None else None
+                            self.current_process = current
+                            self.current_url = replay_song['link']
+                            self.current_song = replay_song
+                            self.current_title = replay_song['name']
+                            self.current_length = replay_song['duration']
+                            self.current_start_time = time.time()
+                            self.current_elapsed = None
+                            self.current_rating = None
+
+                        print(f"\nNow playing (replayed): {replay_song['name']}")
+                        continue
+
                     if self.skip_event.is_set():
 
                         self.skip_event.clear()
 
-                        with self.lock:
-                            self.current_elapsed = time.time() - self.current_start_time
+                        if self.stop_event.is_set():
+                            break
 
-                        self._score_current_song()
-
-                        current.kill()
-
-                        current_song = self.get_preloaded_song()
+                        current_song, current = self._settle_next(current, get_next_song)
 
                         if current_song is None:
                             print("No preloaded song available.")
                             self.stop()
                             break
 
-                        current = current_song['process']
-
-                        with self.lock:
-                            self.current_process = current
-                            self.current_url = current_song['link']
-                            self.current_song = current_song
-                            self.current_title = current_song['name']
-                            self.current_length = current_song['duration']
-                            self.current_start_time = time.time()
-                            self.current_rating = None
-
                         print("Starting next song...")
                         self.start_preload(get_next_song)
                         continue
-                    data = current.stdout.read(
-                        4096 * 2 * 2
-                    )
+
+                    try:
+                        data = current.stdout.read(
+                            4096 * 2 * 2
+                        )
+                    except (OSError, ValueError):
+                        data = b""
 
                     if not data:
 
-                        with self.lock:
-                            self.current_elapsed = time.time() - self.current_start_time
+                        if self.stop_event.is_set():
+                            break
 
-                        self._score_current_song()
-
-                        current.kill()
-
-                        current_song = self.get_preloaded_song()
+                        current_song, current = self._settle_next(current, get_next_song)
 
                         if current_song is None:
                             break
-
-                        current = current_song['process']
-
-                        with self.lock:
-                            self.current_process = current
-                            self.current_url = current_song['link']
-                            self.current_song = current_song
-                            self.current_title = current_song['name']
-                            self.current_length = current_song['duration']
-                            self.current_start_time = time.time()
-                            self.current_rating = None
 
                         print(f"\nNow playing: {current_song['name']}")
                         self.start_preload(get_next_song)

@@ -29,11 +29,12 @@ try:
 except Exception:
     pass
 
-GENRES = [
-    "house", "techno", "jazz", "rock", "hip-hop","hiphop", "pop","alt-pop", "reggae", "funk",
-    "soul", "disco", "classical", "latin", "edm", "blues", "country",
-    "metal", "punk", "ambient", "r&b", "indie",'rap'
-]
+# GENRES = [
+#     "house", "techno", "jazz", "rock", "hip-hop","hiphop", "pop","alt-pop", "reggae", "funk",
+#     "soul", "disco", "classical", "latin", "edm", "blues", "country",
+#     "metal", "punk", "ambient", "r&b", "indie",'rap'
+# ]
+GENRES=['house','techno','rock','hip-hop','pop','alt-pop','edm','metal','rap']
 ARTISTS = {
     "Drake": "hip-hop", "Kendrick Lamar": "hip-hop", "Kanye West": "hip-hop",
     "Jay-Z": "hip-hop", "50 Cent": "hip-hop", "Snoop Dogg": "hip-hop",
@@ -57,18 +58,18 @@ ARTISTS = {
     "Queen": "rock", "Led Zeppelin": "rock", "Pink Floyd": "rock", "AC/DC": "rock",
     "Arctic Monkeys": "indie", "The Strokes": "indie", "Tame Impala": "indie",
 
-    "Miles Davis": "jazz", "John Coltrane": "jazz", "Louis Armstrong": "jazz",
-    "Ella Fitzgerald": "jazz", "Nina Simone": "jazz",
+    # "Miles Davis": "jazz", "John Coltrane": "jazz", "Louis Armstrong": "jazz",
+    # "Ella Fitzgerald": "jazz", "Nina Simone": "jazz",
 
-    "Bob Marley": "reggae", "Fela Kuti": "funk", "Toots and the Maytals": "reggae",
-    "Stevie Wonder": "soul", "Marvin Gaye": "soul", "Aretha Franklin": "soul",
-    "James Brown": "funk", "Earth, Wind & Fire": "funk",
+    # "Bob Marley": "reggae", "Fela Kuti": "funk", "Toots and the Maytals": "reggae",
+    # "Stevie Wonder": "soul", "Marvin Gaye": "soul", "Aretha Franklin": "soul",
+    # "James Brown": "funk", "Earth, Wind & Fire": "funk",
 
     "Daddy Yankee": "latin", "Shakira": "latin", "J Balvin": "latin",
     "Karol G": "latin", "Rosalía": "latin",
 
-    "Frédéric Chopin": "classical", "Ludwig van Beethoven": "classical",
-    "Wolfgang Amadeus Mozart": "classical", "Johann Sebastian Bach": "classical",
+    # "Frédéric Chopin": "classical", "Ludwig van Beethoven": "classical",
+    # "Wolfgang Amadeus Mozart": "classical", "Johann Sebastian Bach": "classical",
 }
 
 

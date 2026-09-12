@@ -85,14 +85,25 @@ _db_conn = None
 
 musicbrainzngs.set_useragent("DjAgent", "1.0.0", "https://github.com/13lend1")
 
+def _played_already(song_id):
+    """True if the song was already played (recorded in a genre table)."""
+    try:
+        from duplicates import is_played
+        return is_played(song_id)
+    except Exception as e:
+        print("Played-check failed, treating song as new:", e)
+        return False
+
+
 def get_random_song(max_attempts=5):
     for attempt in range(1, max_attempts + 1):
-        song_url = _fetch_random_song()
-        if song_url:
-            return song_url
-        print(f"Attempt {attempt}/{max_attempts} failed, retrying with a new song...")
+        song = _fetch_random_song()
+        if song and not _played_already(song.get('id')):
+            return song
+        print(f"Attempt {attempt}/{max_attempts} returned an already-played song, "
+              "refetching a new one...")
 
-    print("Could not find a playable song after several attempts.")
+    print("Could not find a playable, unplayed song after several attempts.")
     return None
 
 
@@ -384,6 +395,8 @@ def get_random_songs(n=20, max_attempts=5, batch_size=5, on_song=None, workers=3
     songs = []
     seen = set()
     got = 0
+    skips = 0
+    max_skips = n * 3  # safety valve: stop refetching if we keep hitting played songs
     state_lock = threading.Lock()
 
     # Diversity caps: never flood a batch with one artist, and keep any single
@@ -407,6 +420,10 @@ def get_random_songs(n=20, max_attempts=5, batch_size=5, on_song=None, workers=3
     with ThreadPoolExecutor(max_workers=workers) as ex:
         futures = set()
         while got < n:
+            if skips >= max_skips:
+                print(f"Stopped refetching: {skips} fetched songs were already "
+                      "played — widen the catalog or clear the genre tables.")
+                break
             while len(futures) < workers and got < n:
                 futures.add(ex.submit(_job, random.choice(GENRES)))
             done, futures = wait(futures, timeout=1.0, return_when=FIRST_COMPLETED)
@@ -414,6 +431,9 @@ def get_random_songs(n=20, max_attempts=5, batch_size=5, on_song=None, workers=3
                 song = f.result()
                 if song is None:
                     continue
+                if _played_already(song.get('id')):
+                    skips += 1
+                    continue  # already played — refetch another song instead
                 with state_lock:
                     if song['id'] in seen:
                         continue
@@ -540,11 +560,17 @@ def save(song):
     _db_exec(_run)
 
 
-def save_song_metadata(song, likeability=None):
+def save_song_metadata(song, likeability=None, reorder=False):
     """Upserts a song's row into Songs. Without likeability it leaves the
     existing value untouched; with a value it writes it into the likeability
-    column (used to persist the model's *prediction* for the selected songs)."""
+    column (used to persist the model's *prediction* for the selected songs).
+
+    When reorder=True (used when the playlist queue is persisted) the row is
+    deleted first and re-inserted, so the table keeps rows in the exact order
+    they were selected/queued (a plain upsert would leave old rows scattered)."""
     def _run(conn):
+        if reorder:
+            conn.execute("DELETE FROM Songs WHERE id = ?", (song['id'],))
         conn.execute(
             """
             INSERT INTO Songs

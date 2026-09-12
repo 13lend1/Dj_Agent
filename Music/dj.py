@@ -1,6 +1,7 @@
 import sys, os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import random
+import queue
 import time
 import threading
 import subprocess
@@ -48,6 +49,18 @@ class DJ(PreloadedPlayer):
             return
 
         try:
+            from duplicates import played_ids
+            played = played_ids(c.get('id') for c in candidates)
+        except Exception as e:
+            print("Played-check failed, treating batch as new:", e)
+            played = set()
+        if played:
+            candidates = [c for c in candidates if c.get('id') not in played]
+        if not candidates:
+            print("Batch contained only already-played songs; skipping.")
+            return
+
+        try:
             delete_unscored_songs()
         except Exception as e:
             print("Cleanup failed:", e)
@@ -62,7 +75,13 @@ class DJ(PreloadedPlayer):
             records = random.sample(candidates, min(self.top_n, len(candidates)))
 
         # The Agent orders the n-best and picks the timestamps to play.
-        current = getattr(self, 'current_song', None)
+        # Use the actual next-to-play song (batch tail) as the predecessor
+        # so transitions line up with what will actually follow in the queue;
+        # fallback to the currently-playing song, then to a cold start.
+        with self.batch_lock:
+            current = self.batch[-1] if self.batch else None
+        if not current:
+            current = getattr(self, 'current_song', None)
         if not current:
             current = self.agent.last()
         playlist = self.agent.build_playlist(
@@ -70,12 +89,13 @@ class DJ(PreloadedPlayer):
         ) if records else []
 
         # Agent-approved songs are persisted to the Songs table (the linear
-        # model's prediction); a user rating overwrites it when played.
+        # model's prediction); reorder=True moves them to the table end so
+        # the table rows stay sequential in the current play order.
         for song in playlist:
             likeability = song.get('likeability')
             if likeability is not None:
                 try:
-                    save_song_metadata(song, likeability=likeability)
+                    save_song_metadata(song, likeability=likeability, reorder=True)
                 except Exception as e:
                     print("Save predicted likeability failed:", e)
 
@@ -91,16 +111,17 @@ class DJ(PreloadedPlayer):
 
     # ---- audio: seek to the hook start -----------------------------------
 
-    def prepare_song(self, song):
-        """Seek-aware prepare: accepts a song dict (seeks to play_start_sec)
-        or a plain URL. If the fast 'seek-before-input' fails, ffmpeg is retried
-        without the seek so playback never starts with dead air."""
+    def prepare_song(self, song, seek_to=None):
+        """Seek-aware prepare: accepts a song dict (seeks to play_start_sec, or
+        to `seek_to` seconds into the full track when given) or a plain URL.
+        If the fast 'seek-before-input' fails, ffmpeg is retried without the
+        seek so playback never starts with dead air."""
         if isinstance(song, dict):
             url = song['link']
-            seek = song.get('play_start_sec')
+            seek = seek_to if seek_to is not None else song.get('play_start_sec')
         else:
             url = song
-            seek = None
+            seek = seek_to
 
         options = {
             'format': 'bestaudio/best',
@@ -145,23 +166,58 @@ class DJ(PreloadedPlayer):
         raise RuntimeError(f"Could not prepare audio for {url}")
 
     def preload(self, song_info):
+        if self.stop_event.is_set():
+            return
+
         if song_info is None:
             print("No song available to preload, fetching a random one.")
+            if self.stop_event.is_set():
+                return
             song_info = get_random_song()
 
         if song_info is None:
             print("Could not find a song to preload.")
             return
 
+        if self.stop_event.is_set():
+            return
+
         try:
             process = self.prepare_song(song_info)
-            self.song_queue.put({
-                **song_info,
-                'process': process,
-            })
-            print(f"Preloaded: {song_info['name']} {self._fmt_hook(song_info)}")
         except Exception as e:
             print("Preload error:", e)
+            return
+
+        if self.stop_event.is_set():
+            try:
+                process.kill()
+            except Exception:
+                pass
+            return
+
+        with self._preload_procs_lock:
+            self._preload_processes.add(process)
+
+        try:
+            while not self.stop_event.is_set():
+                try:
+                    self.song_queue.put({
+                        **song_info,
+                        'process': process,
+                    }, timeout=1)
+                    print(f"Preloaded: {song_info['name']} {self._fmt_hook(song_info)}")
+                    break
+                except queue.Full:
+                    continue
+        finally:
+            with self._preload_procs_lock:
+                self._preload_processes.discard(process)
+
+        if self.stop_event.is_set():
+            try:
+                process.kill()
+            except Exception:
+                pass
 
     def _keep_preloaded(self, get_next_song):
         """Keep the preload buffer topped up while a song is playing: spawn at
@@ -228,6 +284,8 @@ class DJ(PreloadedPlayer):
         with self.lock:
             song = dict(self.current_song)
             score = self.current_rating
+
+        self._record_genre(song)
 
         if score is not None:
             likeability = round(score / 9, 2)
@@ -348,6 +406,7 @@ class DJ(PreloadedPlayer):
             print("s = stop")
             print("r = replay the song that played before this one")
             print("a = restart current song from the beginning")
+            print("<- / -> = seek back / forward 5 seconds")
             print("Ctrl+C = stop\n")
 
             while not self.stop_event.is_set():
@@ -397,6 +456,66 @@ class DJ(PreloadedPlayer):
 
                     print(f"\nNow playing (replayed): {self.current_title} {self._fmt_hook(replay_song)}",
                           flush=True)
+                    continue
+
+                if self.seek_forward_event.is_set() or self.seek_backward_event.is_set():
+
+                    seek_fwd = self.seek_forward_event.is_set()
+                    self.seek_forward_event.clear()
+                    self.seek_backward_event.clear()
+
+                    with self.lock:
+                        song = dict(self.current_song)
+                        elapsed = time.time() - self.current_start_time
+
+                    start = song.get('play_start_sec') or 0
+                    end = song.get('play_end_sec')
+                    # clip-relative bounds: the hook window expressed in seconds
+                    # elapsed since the clip started (0 == hook start)
+                    if end is not None:
+                        clip_end = end - start
+                    elif song.get('duration'):
+                        clip_end = song['duration'] / 1000 - start
+                    else:
+                        clip_end = None
+                    offset = 5 if seek_fwd else -5
+                    target = elapsed + offset
+
+                    if seek_fwd:
+                        if clip_end is not None and target >= clip_end:
+                            print("\nAt end of song — skipping to next...")
+                            self.skip()
+                            continue
+                        target = max(0.0, target)
+                    else:
+                        if elapsed <= 0.5:
+                            if self.last_song is not None:
+                                print("\nAt start of song — going to previous...")
+                                self.replay()
+                            else:
+                                print("\nAt start of song — restarting...")
+                                self.restart()
+                            continue
+                        target = max(0.0, target)
+
+                    try:
+                        current.kill()
+                    except Exception:
+                        pass
+
+                    # seek_to is in full-track seconds -> hook start + clip-relative target
+                    current = self.prepare_song(song, seek_to=start + target)
+
+                    with self.lock:
+                        self.current_process = current
+                        self.current_start_time = time.time() - target
+                        self.current_elapsed = None
+                        self.current_clip_duration = (
+                            (end - (start + target)) if end is not None else None
+                        )
+
+                    print(f"\nSeeked to {target:.1f}s into the hook: "
+                          f"{self.current_title} {self._fmt_hook(song)}", flush=True)
                     continue
 
                 transitions = (

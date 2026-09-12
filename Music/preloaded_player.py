@@ -28,6 +28,8 @@ class PreloadedPlayer(Player):
         self.pool_size = pool_size
         self.top_n = top_n
         self.model = None  # lazy import to avoid circular dependency at module load
+        self._preload_procs_lock = threading.Lock()
+        self._preload_processes = set()  # in-flight decode processes, killed on stop
 
         threading.Thread(target=self._refill_worker, daemon=True).start()
         threading.Thread(target=self._batch_worker, daemon=True).start()
@@ -95,6 +97,18 @@ class PreloadedPlayer(Player):
             return
 
         try:
+            from duplicates import played_ids
+            played = played_ids(c.get('id') for c in candidates)
+        except Exception as e:
+            print("Played-check failed, treating batch as new:", e)
+            played = set()
+        if played:
+            candidates = [c for c in candidates if c.get('id') not in played]
+        if not candidates:
+            print("Batch contained only already-played songs; skipping.")
+            return
+
+        try:
             delete_unscored_songs()
         except Exception as e:
             print("Cleanup failed:", e)
@@ -123,28 +137,67 @@ class PreloadedPlayer(Player):
         while not self.stop_event.is_set():
             with self.batch_lock:
                 if self.batch:
-                    return self.batch.pop(0)
+                    song = self.batch.pop(0)
+                    break
             time.sleep(0.5)
-        return None
+        else:
+            return None
+        self._record_genre(song)
+        return song
 
     def preload(self, song_info):
+        if self.stop_event.is_set():
+            return
+
         if song_info is None:
             print("No song available to preload, fetching a random one.")
+            if self.stop_event.is_set():
+                return
             song_info = get_random_song()
 
         if song_info is None:
             print("Could not find a song to preload.")
             return
 
+        if self.stop_event.is_set():
+            return
+
         try:
             process = self.prepare_song(song_info['link'])
-            self.song_queue.put({
-                **song_info,
-                'process': process,
-            })
-            print(f"Preloaded: {song_info['name']}")
         except Exception as e:
             print("Preload error:", e)
+            return
+
+        if self.stop_event.is_set():
+            try:
+                process.kill()
+            except Exception:
+                pass
+            return
+
+        with self._preload_procs_lock:
+            self._preload_processes.add(process)
+
+        try:
+            while not self.stop_event.is_set():
+                try:
+                    self.song_queue.put({
+                        **song_info,
+                        'process': process,
+                    }, timeout=1)
+                    print(f"Preloaded: {song_info['name']}")
+                    break
+                except queue.Full:
+                    continue
+        finally:
+            with self._preload_procs_lock:
+                self._preload_processes.discard(process)
+
+        if self.stop_event.is_set():
+            try:
+                process.kill()
+            except Exception:
+                pass
 
     def start_preload(self, get_next_song):
 
@@ -163,10 +216,15 @@ class PreloadedPlayer(Player):
         ).start()
 
     def get_preloaded_song(self, timeout=10):
-        try:
-            return self.song_queue.get(timeout=timeout)
-        except queue.Empty:
-            return None
+        end = time.time() + timeout
+        while time.time() < end:
+            if self.stop_event.is_set():
+                return None
+            try:
+                return self.song_queue.get(timeout=min(0.5, end - time.time()))
+            except queue.Empty:
+                continue
+        return None
 
     def _settle_next(self, current, get_next_song):
         """Settle the outgoing song and hand back (song, process) to play next,
@@ -218,6 +276,7 @@ class PreloadedPlayer(Player):
         print("s = stop")
         print("r = replay the song that played before this one")
         print("a = restart current song from the beginning")
+        print("<- / -> = seek back / forward 5 seconds")
         print("Ctrl+C = stop\n")
 
         try:
@@ -281,6 +340,52 @@ class PreloadedPlayer(Player):
                         print(f"\nNow playing (replayed): {replay_song['name']}")
                         continue
 
+                    if self.seek_forward_event.is_set() or self.seek_backward_event.is_set():
+
+                        seek_fwd = self.seek_forward_event.is_set()
+                        self.seek_forward_event.clear()
+                        self.seek_backward_event.clear()
+
+                        with self.lock:
+                            song = dict(self.current_song)
+                            elapsed = time.time() - self.current_start_time
+
+                        offset = 5 if seek_fwd else -5
+                        target = elapsed + offset
+                        length = song.get('duration')
+
+                        if seek_fwd:
+                            if length and target >= length / 1000:
+                                print("\nAt end of song — skipping to next...")
+                                self.skip()
+                                continue
+                            target = max(0.0, target)
+                        else:
+                            if elapsed <= 0.5:
+                                if self.last_song is not None:
+                                    print("\nAt start of song — going to previous...")
+                                    self.replay()
+                                else:
+                                    print("\nAt start of song — restarting...")
+                                    self.restart()
+                                continue
+                            target = max(0.0, target)
+
+                        try:
+                            current.kill()
+                        except Exception:
+                            pass
+
+                        current = self.prepare_song(song['link'], seek_to=target)
+
+                        with self.lock:
+                            self.current_process = current
+                            self.current_start_time = time.time() - target
+                            self.current_elapsed = None
+
+                        print(f"\nSeeked to {target:.1f}s: {song['name']}")
+                        continue
+
                     if self.skip_event.is_set():
 
                         self.skip_event.clear()
@@ -333,6 +438,20 @@ class PreloadedPlayer(Player):
 
     def stop(self):
         super().stop()
+
+        # kill any in-flight decode workers so preloading halts with the DJ
+        with self._preload_procs_lock:
+            procs = list(self._preload_processes)
+            self._preload_processes.clear()
+        for proc in procs:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+            try:
+                proc.stdout.close()
+            except Exception:
+                pass
 
         while not self.song_queue.empty():
             try:

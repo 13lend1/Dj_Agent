@@ -24,22 +24,33 @@ class LinearRegressionModel():
 
     def fit(self):
         self.data = self._read_table("Songs")
+        # Artist/album/genre may be unknown for singles/solo tracks — give them
+        # a placeholder so those rows still train (and get a sensible encoded
+        # value) instead of being silently dropped.
+        for col in self.data.columns:
+            if self.data[col].dtype == object and col != self.target:
+                self.data[col] = self.data[col].fillna("unknown")
         self.data.dropna(inplace=True)
         y = self.data[self.target]
         # id & link are unique per-row identifiers, NOT predictors: including
         # them makes target-encoding memorize the label (a leak that collapses
         # predictions on unseen songs to the mean, e.g. a constant 0.379).
-        # name/artist/album are ~unique per row (check the cardins) and leak
-        # the same way, so they're dropped too — only genre + audio features
-        # and other real signals stay.
+        # name is ~unique per row as well, so it's dropped too.
+        # artist & album are intentionally KEPT: they carry real signal (who
+        # made it, what record it came from), and the TargetEncoder's smoothed
+        # target encoding is designed for high-cardinality categories like these.
         X = self.data.drop(self.target, axis=1)\
-                     .drop(columns=["id", "link", "name", "artist", "album"], errors="ignore")
+                     .drop(columns=["id", "link", "name"], errors="ignore")
 
         # any remaining categorical with near-unique values is still a leak:
-        # drop columns whose cardinality is more than half the training rows
+        # drop columns whose cardinality is more than half the training rows —
+        # but never artist/album, which are explicitly requested predictors.
+        protected = {"artist", "album"}
         cat_candidates = X.select_dtypes(include=['object']).columns.tolist()
         n = len(X)
         for col in cat_candidates:
+            if col in protected:
+                continue
             if X[col].nunique() > max(2, n // 2):
                 X = X.drop(columns=[col])
 
@@ -62,6 +73,11 @@ class LinearRegressionModel():
         for col in self.num_cols:
             if col in X.columns:
                 X[col] = pd.to_numeric(X[col], errors='coerce')
+        # mirror fit(): missing categorical values become "unknown" so unseen
+        # artists/albums encode like they did during training
+        for col in self.cat_cols:
+            if col in X.columns:
+                X[col] = X[col].fillna("unknown")
         encoded = self.encoder.transform(X[self.cat_cols])
         X_final = pd.concat([encoded, X[self.num_cols]], axis=1)
         return X_final

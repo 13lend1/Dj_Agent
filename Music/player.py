@@ -19,6 +19,8 @@ class Player:
         self.skip_event = threading.Event()
         self.replay_event = threading.Event()
         self.restart_event = threading.Event()
+        self.seek_forward_event = threading.Event()
+        self.seek_backward_event = threading.Event()
         self.last_song = None
         self.current_length = None
         self.current_elapsed = None
@@ -28,6 +30,31 @@ class Player:
         self.lock = threading.Lock()
 
         threading.Thread(target=self._save_worker, daemon=True).start()
+        self._ensure_genre_tables()
+
+    def _ensure_genre_tables(self):
+        """Create the per-genre 'played songs' tables so every genre has one."""
+        try:
+            from duplicates import genre_table
+            from songs import GENRES, ARTISTS
+            for genre in set(list(GENRES) + list(ARTISTS.values())):
+                try:
+                    genre_table(genre)
+                except Exception:
+                    pass
+        except Exception as e:
+            print("Failed to ensure genre tables:", e)
+
+    def _record_genre(self, song):
+        """Record a played song into its genre table so it won't be played twice."""
+        genre = song.get('genre')
+        if not genre or not song.get('id'):
+            return
+        try:
+            from duplicates import save_genre
+            save_genre(song, genre)
+        except Exception as e:
+            print("Save genre failed:", e)
 
     def _save_worker(self):
         while True:
@@ -48,7 +75,15 @@ class Player:
     def restart(self):
         self.restart_event.set()
 
-    def prepare_song(self, url):
+    def seek_forward(self):
+        """Skip 5s ahead (falls back to next song at the end of a track)."""
+        self.seek_forward_event.set()
+
+    def seek_backward(self):
+        """Skip 5s back (falls back to the previous song at the start)."""
+        self.seek_backward_event.set()
+
+    def prepare_song(self, url, seek_to=None):
 
         options = {
             'format': 'bestaudio/best',
@@ -60,16 +95,20 @@ class Player:
             info = ydl.extract_info(url, download=False)
             stream_url = info['url']
 
+        cmd = ['ffmpeg']
+        if seek_to is not None and seek_to > 0:
+            cmd += ['-ss', str(seek_to)]
+        cmd += [
+            '-i', stream_url,
+            '-f', 's16le',
+            '-acodec', 'pcm_s16le',
+            '-ar', '44100',
+            '-ac', '2',
+            '-'
+        ]
+
         process = subprocess.Popen(
-            [
-                'ffmpeg',
-                '-i', stream_url,
-                '-f', 's16le',
-                '-acodec', 'pcm_s16le',
-                '-ar', '44100',
-                '-ac', '2',
-                '-'
-            ],
+            cmd,
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
             bufsize=0
@@ -97,6 +136,7 @@ class Player:
         print("s = stop")
         print("r = replay the song that played before this one")
         print("a = restart current song from the beginning")
+        print("<- / -> = seek back / forward 5 seconds")
         print("Ctrl+C = stop\n")
 
         try:
@@ -158,6 +198,54 @@ class Player:
                             self.current_rating = None
 
                         print(f"\nNow playing (replayed): {replay_song['name']}")
+                        continue
+
+                    if self.seek_forward_event.is_set() or self.seek_backward_event.is_set():
+
+                        seek_fwd = self.seek_forward_event.is_set()
+                        self.seek_forward_event.clear()
+                        self.seek_backward_event.clear()
+
+                        with self.lock:
+                            song = dict(self.current_song)
+                            elapsed = time.time() - self.current_start_time
+
+                        offset = 5 if seek_fwd else -5
+                        target = elapsed + offset
+                        length = song.get('duration')
+
+                        if seek_fwd:
+                            # can't seek past the end -> skip to the next song
+                            if length and target >= length / 1000:
+                                print("\nAt end of song — skipping to next...")
+                                self.skip()
+                                continue
+                            target = max(0.0, target)
+                        else:
+                            # can't seek back beyond the start -> go to previous song
+                            if elapsed <= 0.5:
+                                if self.last_song is not None:
+                                    print("\nAt start of song — going to previous...")
+                                    self.replay()
+                                else:
+                                    print("\nAt start of song — restarting...")
+                                    self.restart()
+                                continue
+                            target = max(0.0, target)
+
+                        try:
+                            current.kill()
+                        except Exception:
+                            pass
+
+                        current = self.prepare_song(song['link'], seek_to=target)
+
+                        with self.lock:
+                            self.current_process = current
+                            self.current_start_time = time.time() - target
+                            self.current_elapsed = None
+
+                        print(f"\nSeeked to {target:.1f}s: {song['name']}")
                         continue
 
                     if self.skip_event.is_set():
@@ -263,6 +351,8 @@ class Player:
             seconds_listened = self.current_elapsed
             score = self.current_rating
 
+        self._record_genre(song)
+
         if not song.get('duration'):
             return
 
@@ -283,6 +373,8 @@ class Player:
         replay is the strongest like signal, so it is set to 1.0."""
         with self.lock:
             song = dict(song)
+
+        self._record_genre(song)
 
         likeability = 1.0
 
@@ -335,7 +427,7 @@ class Player:
             fd = sys.stdin.fileno()
             old_settings = termios.tcgetattr(fd)
 
-        print("n = next | s = stop | r = replay previous song | a = restart song | 0-9 = rate song (0.0-1.0)")
+        print("n = next | s = stop | r = replay previous song | a = restart song | <- / -> = seek back / forward 5s | 0-9 = rate song (0.0-1.0)")
 
         try:
             if not is_windows:
@@ -344,18 +436,47 @@ class Player:
             while not self.stop_event.is_set():
 
                 if is_windows:
-                    if msvcrt.kbhit():
-                        key = msvcrt.getwch().lower()
-                    else:
+                    if not msvcrt.kbhit():
                         time.sleep(0.05)
                         continue
+                    key = msvcrt.getwch()
+                    # arrow keys come as a two-char sequence (prefix + direction)
+                    if key in ('\xe0', '\x00'):
+                        arrow = msvcrt.getwch()
+                        if arrow == 'M':  # right arrow
+                            print("\nSeeking forward 5s...")
+                            self.seek_forward()
+                        elif arrow == 'K':  # left arrow
+                            print("\nSeeking backward 5s...")
+                            self.seek_backward()
+                        continue
+                    key = key.lower()
                 else:
                     ready, _, _ = select.select([sys.stdin], [], [], 0.1)
 
                     if not ready:
                         continue
 
-                    key = sys.stdin.read(1).lower()
+                    key = sys.stdin.read(1)
+                    if key == '\x1b':
+                        # escape sequence: consume '[' then the direction byte
+                        ready, _, _ = select.select([sys.stdin], [], [], 0.1)
+                        if ready:
+                            seq1 = sys.stdin.read(1)
+                        else:
+                            continue
+                        ready, _, _ = select.select([sys.stdin], [], [], 0.1)
+                        if not ready:
+                            continue
+                        seq2 = sys.stdin.read(1)
+                        if seq2 == 'C':  # right arrow
+                            print("\nSeeking forward 5s...")
+                            self.seek_forward()
+                        elif seq2 == 'D':  # left arrow
+                            print("\nSeeking backward 5s...")
+                            self.seek_backward()
+                        continue
+                    key = key.lower()
 
                 if key == 'n':
                     print("\nSkipping...")

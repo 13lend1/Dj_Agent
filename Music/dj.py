@@ -7,6 +7,15 @@ import threading
 import subprocess
 import numpy as np
 import yt_dlp
+import shutil
+
+try:
+    from yt_dlp.networking.impersonate import ImpersonateTarget
+    _IMPERSONATE = ImpersonateTarget.from_str('chrome')
+except Exception:
+    _IMPERSONATE = None
+
+_DENO = {'deno': {'path': shutil.which('deno')}} if shutil.which('deno') else {'deno': {}}
 import sounddevice as sd
 
 from preloaded_player import PreloadedPlayer
@@ -16,6 +25,10 @@ from songs import (
     take_preprocessed_batch,
     delete_unscored_songs,
     save_song_metadata,
+)
+
+EFFECTS_DIR = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "effects"
 )
 
 
@@ -42,6 +55,53 @@ class DJ(PreloadedPlayer):
 
     _CHUNK = 4096 * 2 * 2  # 4096 stereo int16 frames
     DEFAULT_TRANSITION = {"type": "crossfade", "crossfade_sec": 2.0, "note": "Default crossfade."}
+    _effect_cache = {}
+    _effect_lock = threading.Lock()
+
+    @classmethod
+    def _load_effect(cls, name):
+        """Decode effects/<name>.mp3 into an int16 PCM (N, 2) buffer, once.
+        Returns None (never raises) when the name is empty/'none' or the file
+        is missing, so a bad effect can never break playback."""
+        if not name or name == "none":
+            return None
+        with cls._effect_lock:
+            if name in cls._effect_cache:
+                return cls._effect_cache[name]
+            samples = None
+            path = os.path.join(EFFECTS_DIR, f"{name}.mp3")
+            if os.path.isfile(path):
+                try:
+                    proc = subprocess.Popen(
+                        ['ffmpeg', '-nostdin', '-loglevel', 'error', '-i', path,
+                        '-f', 's16le', '-acodec', 'pcm_s16le',
+                        '-ar', '44100', '-ac', '2', '-'],
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.DEVNULL,
+                    )
+                    raw, _ = proc.communicate(timeout=15)
+                    if proc.returncode != 0 or not raw:
+                        pass
+                        # print(f"[effect] ffmpeg failed decoding '{name}' (path={path}, "
+                        #     f"returncode={proc.returncode}, bytes={len(raw or b'')})")
+                    arr = np.frombuffer(raw, dtype=np.int16)
+                    arr = arr[:len(arr) // 2 * 2].reshape(-1, 2).astype(np.int32)
+                    if len(arr):
+                        peak = int(np.abs(arr).max())
+                        if peak > 0:
+                            arr = (arr.astype(np.float64) / peak * 26214.0).astype(np.int32)
+                        samples = arr
+                    else:
+                        pass
+                        # print(f"[effect] '{name}' decoded to 0 samples (path={path})")
+                except Exception as e:
+                    # print(f"[effect] exception loading '{name}' (path={path}): {e}")
+                    samples = None
+            else:
+                pass
+                # print(f"[effect] file not found: {path}  (EFFECTS_DIR={EFFECTS_DIR})")
+            cls._effect_cache[name] = samples
+            return samples
 
     def _fetch_batch(self):
         candidates = take_preprocessed_batch(n=self.pool_size)
@@ -127,13 +187,34 @@ class DJ(PreloadedPlayer):
             'format': 'bestaudio/best',
             'quiet': True,
             'noplaylist': True,
+            'socket_timeout': 30,
+            'retries': 3,
+            'impersonate': _IMPERSONATE,
+            'force_ipv4': True,
+            'js_runtimes': _DENO,
+            'remote_components': ['ejs:github'],
+            'http_headers': {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+                              'AppleWebKit/537.36 (KHTML, like Gecko) '
+                              'Chrome/126.0 Safari/537.36',
+                'Accept': '*/*',
+            },
         }
 
         for use_seek in ([seek] if seek else [None]):
             try:
-                with yt_dlp.YoutubeDL(options) as ydl:
-                    info = ydl.extract_info(url, download=False)
-                    stream_url = info['url']
+                _info_holder = {}
+
+                def _run_extract():
+                    with yt_dlp.YoutubeDL(options) as ydl:
+                        _info_holder['info'] = ydl.extract_info(url, download=False)
+
+                _extract_thread = threading.Thread(target=_run_extract, daemon=True)
+                _extract_thread.start()
+                _extract_thread.join(timeout=60)
+                if _extract_thread.is_alive():
+                    raise TimeoutError(f"yt-dlp extract timed out for {url}")
+                stream_url = _info_holder['info']['url']
 
                 process = subprocess.Popen(
                     ['ffmpeg'] +
@@ -239,7 +320,7 @@ class DJ(PreloadedPlayer):
 
     def _preload_worker(self, get_next_song):
         try:
-            self.preload(get_next_song())
+            self.preload(get_next_song(timeout=12))
         finally:
             with self._preload_lock:
                 self._preloading = False
@@ -299,18 +380,29 @@ class DJ(PreloadedPlayer):
         song['score'] = likeability
         self.save_queue.put(song)
 
-    def _crossfade(self, out_process, in_process, stream, secs):
+    def _crossfade(self, out_process, in_process, stream, secs, effect=None):
         """Equal-power crossfade from out_process into in_process over `secs`.
 
         Progress is measured by bytes actually written (== audio time consumed,
         since stream.write blocks on real playback), so the ramp stays correct
-        regardless of how fast the pipes drain."""
+        regardless of how fast the pipes drain.
+
+        `effect` is an optional (N, 2) int32 PCM buffer (44100 Hz stereo) mixed
+        on top of the blend for as long as it lasts, with its own fast fade-in
+        and tail fade-out so it sits cleanly over the transition.
+        """
         if not secs or secs <= 0:
             return
         bytes_per_sec = 44100 * 2 * 2
         fade_bytes = int(secs * bytes_per_sec)
         written = 0
         half_pi = np.pi / 2
+        eff = effect if (effect is not None and len(effect)) else None
+        eff_len = 0 if eff is None else len(eff)
+        eff_i = 0
+        eff_gain = 0.9
+        fade_in_frames = int(0.08 * 44100)
+        fade_out_frames = int(0.2 * 44100)
 
         while not self.stop_event.is_set():
             t = 1.0 if fade_bytes <= 0 else min(written / fade_bytes, 1.0)
@@ -326,31 +418,46 @@ class DJ(PreloadedPlayer):
 
             if not a and not b:
                 break
-            if not a:
-                stream.write(b)
-                written += len(b) if isinstance(b, bytes) else 0
-            elif not b:
-                stream.write(a)
-                written += len(a) if isinstance(a, bytes) else 0
-            else:
-                a = a[:len(a) // 4 * 4]
-                b = b[:len(b) // 4 * 4]
-                n = min(len(a), len(b))
-                ba = np.frombuffer(a[:n], dtype=np.int16).astype(np.int32)
-                bb = np.frombuffer(b[:n], dtype=np.int16).astype(np.int32)
-                out_gain = np.cos(t * half_pi)
-                in_gain = np.sin(t * half_pi)
-                mix = np.clip(ba * out_gain + bb * in_gain, -32768, 32767).astype(np.int16)
-                chunk = mix.tobytes()
-                stream.write(chunk)
-                written += len(chunk)
+            a = a[:len(a) // 4 * 4]
+            b = b[:len(b) // 4 * 4]
+            nframes = max(len(a), len(b)) // 4
+            n_samples = nframes * 2
+            ba = np.zeros(n_samples, dtype=np.int32)
+            bb = np.zeros(n_samples, dtype=np.int32)
+            if a:
+                ba[:len(a) // 2] = np.frombuffer(a, dtype=np.int16).astype(np.int32)
+            if b:
+                bb[:len(b) // 2] = np.frombuffer(b, dtype=np.int16).astype(np.int32)
+            out_gain = np.cos(t * half_pi)
+            in_gain = np.sin(t * half_pi)
+            mix = ba * out_gain + bb * in_gain
+            if eff is not None:
+                eff_chunk = eff[eff_i:eff_i + nframes]
+                have = len(eff_chunk)
+                if have:
+                    idx = np.arange(eff_i, eff_i + have)
+                    g = np.ones(have, dtype=np.float64)
+                    if fade_in_frames > 0:
+                        head = idx < fade_in_frames
+                        g[head] *= (idx[head] + 1.0) / fade_in_frames
+                    if fade_out_frames > 0:
+                        tail = eff_len - idx
+                        tail_mask = tail < fade_out_frames
+                        g[tail_mask] *= (tail[tail_mask] + 1.0) / fade_out_frames
+                    mix[:have * 2] += eff_chunk.reshape(-1) * (eff_gain * g).repeat(2)
+                eff_i += nframes
+            mix = np.clip(mix, -32768, 32767).astype(np.int16)
+            chunk = mix.tobytes()
+            stream.write(chunk)
+            written += len(chunk)
 
             if t >= 1.0:
                 return
 
-    def _advance(self, current, stream, crossfade_sec):
+    def _advance(self, current, stream, crossfade_sec, effect=None):
         """Move from the current (outgoing) process into the next: crossfade if
-        requested, then kill the old process and hand the deck to the new song.
+        requested (optionally layered with a transition effect clip), then kill
+        the old process and hand the deck to the new song.
         The outgoing song is remembered as the previously played one."""
         if self.stop_event.is_set():
             return None
@@ -358,12 +465,13 @@ class DJ(PreloadedPlayer):
         with self.lock:
             outgoing = dict(self.current_song) if self.current_song is not None else None
 
-        next_song = self.get_preloaded_song(timeout=20)
+        next_song = self.get_preloaded_song(timeout=10)
         if next_song is None:
             return None
         next_process = next_song['process']
         if crossfade_sec and crossfade_sec > 0:
-            self._crossfade(current, next_process, stream, crossfade_sec)
+            effect_samples = self._load_effect(effect)
+            self._crossfade(current, next_process, stream, crossfade_sec, effect=effect_samples)
         try:
             current.kill()
         except Exception:
@@ -525,6 +633,7 @@ class DJ(PreloadedPlayer):
                 crossfade_sec = self._transition_secs(transitions.get('crossfade_sec'))
                 clip = self.current_clip_duration
                 crossfade_sec = self._cap_crossfade(clip, crossfade_sec)
+                effect = transitions.get('effect')
 
                 if self.skip_event.is_set():
 
@@ -542,7 +651,7 @@ class DJ(PreloadedPlayer):
                         if transitions.get('type') != 'cut':
                             print(f"Crossfading out: {transitions.get('note', '')}")
 
-                    next_song = self._advance(current, stream, crossfade_sec)
+                    next_song = self._advance(current, stream, crossfade_sec, effect=effect)
 
                     if next_song is None:
                         print("No preloaded song available.")
@@ -571,7 +680,7 @@ class DJ(PreloadedPlayer):
                         if transitions.get('type') != 'cut':
                             print(f"\nCrossfading to next: {transitions.get('note', '')}")
 
-                    next_song = self._advance(current, stream, crossfade_sec)
+                    next_song = self._advance(current, stream, crossfade_sec, effect=effect)
 
                     if next_song is None:
                         # preload is still warming up / pool refilling: keep the
@@ -605,7 +714,8 @@ class DJ(PreloadedPlayer):
 
                     self._score_current_song()
 
-                    next_song = self._advance(current, stream, 0.0)
+                    fade = crossfade_sec if (crossfade_sec and crossfade_sec > 0) else self.DEFAULT_TRANSITION['crossfade_sec']
+                    next_song = self._advance(current, stream, fade, effect=effect)
 
                     if next_song is None:
                         break

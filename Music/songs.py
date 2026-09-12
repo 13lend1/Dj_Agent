@@ -6,6 +6,7 @@ import sys
 import os
 import threading
 import time
+import json
 import collections
 from concurrent.futures import ThreadPoolExecutor, FIRST_COMPLETED, wait
 from audio_specs import get_features_cached
@@ -20,8 +21,29 @@ def _get_yt():
     global _yt
     if _yt is None:
         from ytmusicapi import YTMusic
-        _yt = YTMusic()
+        _yt = YTMusic("Music/headers_auth.json")
     return _yt
+
+
+def _reset_yt():
+    """Drop the shared YTMusic client so the next call builds a fresh one.
+    YouTube's anonymous innerTube sessions go stale / get bot-checked and
+    start returning empty bodies ('Expecting value: line 1 column 1') — a
+    new client usually clears it."""
+    global _yt
+    _yt = None
+
+
+_yt_error_logged_at = [0.0]
+
+
+def _log_ytscrape_error(prefix, exc):
+    """Print scrape errors at most once per 30s so a dead API doesn't spam
+    the console once per song."""
+    now = time.time()
+    if now - _yt_error_logged_at[0] > 30:
+        _yt_error_logged_at[0] = now
+        print(f"{prefix}: {exc}")
 
 try:
     sys.stdout.reconfigure(encoding='utf-8', errors='replace')
@@ -273,26 +295,108 @@ def _best_match(results, title, artist=None):
 
 
 def _yt_search_link(title, artist, max_results=10):
-    """Fast link lookup via YTMusic — returns a playable watch URL or None.
-    Much quicker than a full yt-dlp youtube search."""
-    try:
-        results = _get_yt().search(f"{title} {artist}", filter="songs", limit=max_results)
-    except Exception as e:
-        print("YTMusic search error:", e)
-        return None
-    if not results:
-        return None
-    video = _best_match(results, title, artist)
-    if not video or not video.get('videoId'):
-        return None
-    return f"https://music.youtube.com/watch?v={video['videoId']}"
+    """Find the song's link via YTMusic (primary). The search is retried once
+    with a fresh client for transient/blank innertube responses; yt-dlp is
+    only a last-resort backup when the retry also fails or returns no match."""
+    time.sleep(0.1)
+    for attempt in range(2):
+        try:
+            results = _get_yt().search(f"{title} {artist}", filter="songs", limit=max_results)
+            video = _best_match(results, title, artist)
+            if video and video.get('videoId'):
+                return f"https://music.youtube.com/watch?v={video['videoId']}"
+            break  # definitive miss or no good match -> no retry needed
+        except Exception as e:
+            _log_ytscrape_error("YTMusic search error", e)
+            _reset_yt()
+        if attempt == 0:
+            continue
+    return _ytdl_search_link(title, artist)
 
+
+def _is_yt_blank_response(exc):
+    """True when ytmusicapi choked on an empty/invalid body ('Expecting value')
+    rather than a genuine network error."""
+    return isinstance(exc, json.JSONDecodeError) or "Expecting value" in str(exc)
+
+_ytdl = None
+
+def _get_ytdl():
+    global _ytdl
+    if _ytdl is None:
+        import yt_dlp
+        import shutil
+        from yt_dlp.networking.impersonate import ImpersonateTarget
+        deno_path = shutil.which('deno')
+        _ytdl = yt_dlp.YoutubeDL({
+            'quiet': True,
+            'noplaylist': True,
+            'skip_download': True,
+            'extract_flat': True,
+            'default_search': 'ytsearch',
+            'socket_timeout': 20,
+            'retries': 3,
+            'impersonate': ImpersonateTarget.from_str('chrome'),
+            'force_ipv4': True,
+            'js_runtimes': {'deno': {'path': deno_path}} if deno_path else {'deno': {}},
+            'remote_components': ['ejs:github'],
+            'http_headers': {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+                              'AppleWebKit/537.36 (KHTML, like Gecko) '
+                              'Chrome/126.0 Safari/537.36',
+                'Accept': '*/*',
+            },
+        })
+    return _ytdl
+
+def _reset_ytdl():
+    """Drop the shared YoutubeDL instance so the next call builds a fresh
+    one — mirrors _reset_yt() for the YTMusic client."""
+    global _ytdl
+    _ytdl = None
+
+
+def _ytdl_search_link(title, artist, max_results=5):
+    """Last-resort link lookup via yt-dlp when YTMusic is not responding."""
+    time.sleep(0.1)
+    try:
+        ydl = _get_ytdl()
+    except Exception as e:
+        _log_ytscrape_error("yt-dlp init error", e)
+        return None
+
+    try:
+        _info_holder = {}
+
+        def _run_search():
+            _info_holder['info'] = ydl.extract_info(
+                f"ytsearch{max_results}:{title} {artist}", download=False)
+
+        _search_thread = threading.Thread(target=_run_search, daemon=True)
+        _search_thread.start()
+        _search_thread.join(timeout=100)
+        if _search_thread.is_alive():
+            _reset_ytdl()
+            _log_ytscrape_error("yt-dlp search error", TimeoutError("extract timed out"))
+            return None
+        info = _info_holder.get('info')
+    except Exception as e:
+        _log_ytscrape_error("yt-dlp search error", e)
+        _reset_ytdl()  # cheap; a broken/blocked session shouldn't stick around
+        return None
+
+    for ent in (info or {}).get('entries') or []:
+        if ent and ent.get('id') and not ent.get('is_live'):
+            return f"https://www.youtube.com/watch?v={ent['id']}"
+    return None
 
 def _yt_fallback(term, genre):
     try:
         results = _get_yt().search(term, filter="songs", limit=20)
     except Exception as e:
-        print("YTMusic fallback search error:", e)
+        _log_ytscrape_error("YTMusic fallback search error", e)
+        if _is_yt_blank_response(e):
+            _reset_yt()
         return None
     if not results:
         return None
@@ -446,7 +550,7 @@ def get_random_songs(n=20, max_attempts=5, batch_size=5, on_song=None, workers=3
                     genre_count[song['genre']] += 1
                     got += 1
                     progress = got
-                print(f"[{progress}/{n}] {song['name']} - {song['artist']}")
+                # print(f"[{progress}/{n}] {song['name']} - {song['artist']}")
                 if on_song:
                     on_song(song)
                 songs.append(song)
@@ -705,9 +809,11 @@ if __name__=="__main__":
         fill_preprocessed(target=n)
         sys.exit(0)
 
-    options={
-        "quiet":True,
-        "extract_flat":True
+    options = {
+        'format': 'ba/b',
+        'quiet': True,
+        'noplaylist': True,
+        'extractor_args': {'youtube': {'player_client': ['android', 'web']}},
     }
 
     musicbrainzngs.set_useragent("DjAgent", "1.0.0", "https://github.com/13lend1")

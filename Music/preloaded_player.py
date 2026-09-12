@@ -133,12 +133,15 @@ class PreloadedPlayer(Player):
             self.batch.extend(records)
         print(f"Queued batch of {len(records)} songs — predicted likeability saved (pool {self.pool_size}, best {self.top_n}).")
 
-    def get_next_song(self):
+    def get_next_song(self, timeout=None):
+        start = time.time()
         while not self.stop_event.is_set():
             with self.batch_lock:
                 if self.batch:
                     song = self.batch.pop(0)
                     break
+            if timeout is not None and time.time() - start > timeout:
+                return None
             time.sleep(0.5)
         else:
             return None

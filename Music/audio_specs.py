@@ -38,6 +38,14 @@ def _rate_limit_notice(reset=True):
         _MAX_429_MSG = now
 
 
+def _close_response(res):
+    if res is not None:
+        try:
+            res.close()
+        except Exception:
+            pass
+
+
 def _get_json(path):
     """Throttled GET helper with exponential backoff on 429/5xx/timeouts.
     Returns parsed JSON, None on a definitive miss, or raises RateLimited."""
@@ -46,20 +54,30 @@ def _get_json(path):
     for attempt in range(4):  # up to 3 retries
         conn = http.client.HTTPSConnection("api.reccobeats.com", timeout=10)
         headers = {'Accept': 'application/json'}
+        res = None
         try:
             conn.request("GET", path, '', headers)
             res = conn.getresponse()
             data = res.read().decode("utf-8", errors="replace")
+            # Close the response BEFORE the connection: closing the socket
+            # underneath an open HTTPResponse makes its GC finalizer flush a
+            # closed file ("Exception ignored while finalizing ..."). The
+            # object itself keeps its attributes, so status checks still work.
+            _close_response(res)
         except (TimeoutError, OSError) as e:
             print(f"ReccoBeats network error: {e}")
-            conn.close()
+            _close_response(res)
             if attempt < 3:
                 time.sleep(backoff)
                 backoff *= 2
                 continue
             return None
         finally:
-            conn.close()
+            _close_response(res)
+            try:
+                conn.close()
+            except Exception:
+                pass
 
         if res.status == 200:
             return json.loads(data)

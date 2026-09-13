@@ -39,15 +39,29 @@ class PreloadedPlayer(Player):
             from Model.linear_regression import LinearRegressionModel
             self.model = LinearRegressionModel()
 
-    def _refill_worker(self, low_water=None, refill_n=None, check_interval=5):
+    def _refill_worker(self, low_water=None, check_interval=5):
+        """Keep the Preprocessed pool topped up nonstop while the DJ is active.
+
+        Instead of waiting until the pool runs dry (one fetch, then idle), it
+        rolls toward a high-water mark: finishing one fetch chunk then starting
+        the next immediately as long as the pool is below target. Candidates are
+        also inserted progressively inside each chunk, so the batch worker and
+        playback always find pool ready.
+        """
         if low_water is None:
             low_water = self.pool_size
-        if refill_n is None:
-            refill_n = self.pool_size
+        top_n = getattr(self, 'top_n', None) or low_water
+        high_water = getattr(self, 'prefill_high_water', None) or max(2 * low_water, low_water + top_n)
+        max_chunk = 50  # one fetch round is still snappy; the loop chains them
         while not self.stop_event.is_set():
             try:
-                if preprocessed_count() < low_water:
-                    get_random_songs(n=refill_n, on_song=save_preprocessed)
+                count = preprocessed_count()
+                need = high_water - count
+                if need >= 5:
+                    get_random_songs(
+                        n=min(need, max_chunk),
+                        on_song=save_preprocessed,
+                    )
             except Exception as e:
                 print("Refill error:")
                 traceback.print_exc()

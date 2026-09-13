@@ -52,8 +52,10 @@ class DJ(PreloadedPlayer):
         self._advance_fail_count = 0
         self._preload_lock = threading.Lock()
         self._preloading = False
+        self._play_gain = 1.0  # per-song loudness-matched gain, applied to the live stream
 
     _CHUNK = 4096 * 2 * 2  # 4096 stereo int16 frames
+    MIN_CROSSFADE = 2.0     # anything shorter sounds like a hard cut
     DEFAULT_TRANSITION = {"type": "crossfade", "crossfade_sec": 2.0, "note": "Default crossfade."}
     _effect_cache = {}
     _effect_lock = threading.Lock()
@@ -201,20 +203,30 @@ class DJ(PreloadedPlayer):
             },
         }
 
-        for use_seek in ([seek] if seek else [None]):
+        last_exc = None
+        for use_seek in ([seek, None] if seek else [None]):
+            if self.stop_event.is_set():
+                raise RuntimeError(f"Stopped while preparing {url}")
             try:
                 _info_holder = {}
 
                 def _run_extract():
-                    with yt_dlp.YoutubeDL(options) as ydl:
-                        _info_holder['info'] = ydl.extract_info(url, download=False)
+                    try:
+                        with yt_dlp.YoutubeDL(options) as ydl:
+                            _info_holder['info'] = ydl.extract_info(url, download=False)
+                    except BaseException as exc:
+                        _info_holder['exc'] = exc
 
                 _extract_thread = threading.Thread(target=_run_extract, daemon=True)
                 _extract_thread.start()
                 _extract_thread.join(timeout=60)
                 if _extract_thread.is_alive():
                     raise TimeoutError(f"yt-dlp extract timed out for {url}")
-                stream_url = _info_holder['info']['url']
+                if 'exc' in _info_holder:
+                    raise _info_holder['exc']
+                stream_url = _info_holder['info'].get('url')
+                if not stream_url:
+                    raise RuntimeError(f"No stream URL found for {url}")
 
                 process = subprocess.Popen(
                     ['ffmpeg'] +
@@ -235,16 +247,19 @@ class DJ(PreloadedPlayer):
                     # process exits almost immediately -> retry without the seek
                     time.sleep(0.5)
                     if process.poll() is not None:
-                        continue
+                        raise RuntimeError("ffmpeg exited during seek-based input")
 
                 return process
+            except (KeyboardInterrupt, SystemExit):
+                raise
             except Exception as e:
+                last_exc = e
                 if not use_seek:
                     raise
                 # extraction likely failed, not the seek: retry without seek
                 print("prepare_song retrying without seek:", e)
 
-        raise RuntimeError(f"Could not prepare audio for {url}")
+        raise last_exc
 
     def preload(self, song_info):
         if self.stop_event.is_set():
@@ -341,6 +356,7 @@ class DJ(PreloadedPlayer):
             self.current_clip_duration = (
                 (end - start) if (start is not None and end is not None) else None
             )
+        self._play_gain = 1.0
         self.agent.track(song)
 
     @staticmethod
@@ -358,6 +374,15 @@ class DJ(PreloadedPlayer):
             return crossfade_sec
         solo = min(5.0, clip / 2.0)
         return min(crossfade_sec, max(0.0, clip - solo))
+
+    @staticmethod
+    def _soft_limit(samples):
+        """Turn a float audio array into int16, soft-limiting any peaks that a
+        volume boost would push past full scale (tanh) instead of hard-clipping,
+        so loudness-matched songs don't turn to harsh distortion."""
+        if samples.size and float(np.abs(samples).max()) > 32000.0:
+            samples = np.tanh(samples / 32768.0) * 32768.0
+        return np.clip(samples, -32768, 32767).astype(np.int16)
 
     def _score_current_song(self):
         """Likeability stays the model's prediction for the song, unless the
@@ -381,7 +406,14 @@ class DJ(PreloadedPlayer):
         self.save_queue.put(song)
 
     def _crossfade(self, out_process, in_process, stream, secs, effect=None):
-        """Equal-power crossfade from out_process into in_process over `secs`.
+        """Equal-power crossfade from out_process into in_process over `secs`,
+        with automatic loudness matching so the incoming song lands at roughly
+        the same volume as the outgoing one.
+
+        Returns the matched gain to keep applying to the incoming song after
+        the blend ends (1.0 = no change). It is computed from the raw RMS of
+        the two streams (before any fade ramp), so a quietly-mastered song
+        gets boosted while a loud one gets pulled down to match its neighbour.
 
         Progress is measured by bytes actually written (== audio time consumed,
         since stream.write blocks on real playback), so the ramp stays correct
@@ -392,7 +424,7 @@ class DJ(PreloadedPlayer):
         and tail fade-out so it sits cleanly over the transition.
         """
         if not secs or secs <= 0:
-            return
+            return 1.0
         bytes_per_sec = 44100 * 2 * 2
         fade_bytes = int(secs * bytes_per_sec)
         written = 0
@@ -404,13 +436,37 @@ class DJ(PreloadedPlayer):
         fade_in_frames = int(0.08 * 44100)
         fade_out_frames = int(0.2 * 44100)
 
+        # Side-read one chunk from the outgoing: if it has already ended there
+        # is nothing to blend out of, so bring the incoming in quickly instead
+        # of sitting at low volume through a long fade.
+        try:
+            probe = out_process.stdout.read(self._CHUNK)
+        except (OSError, ValueError):
+            probe = b""
+        probe = probe[:len(probe) // 4 * 4]
+        dead_out = len(probe) == 0
+        fast_frac = min(secs, 1.0) / max(secs, 0.001)
+
+        # Loudness matching state (raw levels, measured before any fade ramp).
+        out_level = None                      # smoothed RMS of the outgoing
+        in_level = None                       # smoothed RMS of the incoming
+        gain_in = 1.0
+        ref_level = 0.20 * 32768.0            # ~-14 dBFS anchor when outgoing is dead
+        ema = 0.25
+        min_gain, max_gain = 0.5, 2.0         # +/-6 dB per transition, no crazy swings
+        first_iter = True
+
         while not self.stop_event.is_set():
             t = 1.0 if fade_bytes <= 0 else min(written / fade_bytes, 1.0)
 
-            try:
-                a = out_process.stdout.read(self._CHUNK)
-            except (OSError, ValueError):
-                a = b""
+            if first_iter:
+                a = probe
+                first_iter = False
+            else:
+                try:
+                    a = out_process.stdout.read(self._CHUNK)
+                except (OSError, ValueError):
+                    a = b""
             try:
                 b = in_process.stdout.read(self._CHUNK)
             except (OSError, ValueError):
@@ -428,9 +484,31 @@ class DJ(PreloadedPlayer):
                 ba[:len(a) // 2] = np.frombuffer(a, dtype=np.int16).astype(np.int32)
             if b:
                 bb[:len(b) // 2] = np.frombuffer(b, dtype=np.int16).astype(np.int32)
-            out_gain = np.cos(t * half_pi)
-            in_gain = np.sin(t * half_pi)
-            mix = ba * out_gain + bb * in_gain
+
+            if len(a):
+                rms_a = float(np.sqrt(
+                    np.mean(ba[:len(a) // 2].astype(np.float64) ** 2)
+                )) + 1e-8
+                out_level = rms_a if out_level is None else ema * rms_a + (1 - ema) * out_level
+            if len(b):
+                rms_b = float(np.sqrt(
+                    np.mean(bb[:len(b) // 2].astype(np.float64) ** 2)
+                )) + 1e-8
+                in_level = rms_b if in_level is None else ema * rms_b + (1 - ema) * in_level
+            if in_level is not None:
+                reference = out_level if out_level is not None else ref_level
+                target = min(max(reference / in_level, min_gain), max_gain)
+                gain_in = gain_in + 0.3 * (target - gain_in)
+
+            if dead_out:
+                bt = min(1.0, t / fast_frac)
+                out_gain = 0.0
+                in_gain = np.sin(bt * half_pi)
+            else:
+                out_gain = np.cos(t * half_pi)
+                in_gain = np.sin(t * half_pi)
+
+            mix = ba * out_gain + bb * (in_gain * gain_in)
             if eff is not None:
                 eff_chunk = eff[eff_i:eff_i + nframes]
                 have = len(eff_chunk)
@@ -446,13 +524,15 @@ class DJ(PreloadedPlayer):
                         g[tail_mask] *= (tail[tail_mask] + 1.0) / fade_out_frames
                     mix[:have * 2] += eff_chunk.reshape(-1) * (eff_gain * g).repeat(2)
                 eff_i += nframes
-            mix = np.clip(mix, -32768, 32767).astype(np.int16)
+            mix = self._soft_limit(mix)
             chunk = mix.tobytes()
             stream.write(chunk)
             written += len(chunk)
 
             if t >= 1.0:
-                return
+                break
+
+        return float(np.clip(gain_in, min_gain, max_gain))
 
     def _advance(self, current, stream, crossfade_sec, effect=None):
         """Move from the current (outgoing) process into the next: crossfade if
@@ -469,14 +549,18 @@ class DJ(PreloadedPlayer):
         if next_song is None:
             return None
         next_process = next_song['process']
+        matched_gain = 1.0
         if crossfade_sec and crossfade_sec > 0:
             effect_samples = self._load_effect(effect)
-            self._crossfade(current, next_process, stream, crossfade_sec, effect=effect_samples)
+            matched_gain = self._crossfade(
+                current, next_process, stream, crossfade_sec, effect=effect_samples
+            )
         try:
             current.kill()
         except Exception:
             pass
         self._begin_song(next_song, next_process)
+        self._play_gain = matched_gain
         self.last_song = outgoing
         return next_song
 
@@ -621,6 +705,7 @@ class DJ(PreloadedPlayer):
                         self.current_clip_duration = (
                             (end - (start + target)) if end is not None else None
                         )
+                        self._play_gain = 1.0
 
                     print(f"\nSeeked to {target:.1f}s into the hook: "
                           f"{self.current_title} {self._fmt_hook(song)}", flush=True)
@@ -631,6 +716,7 @@ class DJ(PreloadedPlayer):
                     or self.DEFAULT_TRANSITION
                 )
                 crossfade_sec = self._transition_secs(transitions.get('crossfade_sec'))
+                crossfade_sec = max(crossfade_sec, self.MIN_CROSSFADE)
                 clip = self.current_clip_duration
                 crossfade_sec = self._cap_crossfade(clip, crossfade_sec)
                 effect = transitions.get('effect')
@@ -725,7 +811,11 @@ class DJ(PreloadedPlayer):
                     self._keep_preloaded(get_next_song)
                     continue
 
-                stream.write(data)
+                if data:
+                    if self._play_gain != 1.0:
+                        raw = np.frombuffer(data, dtype=np.int16).astype(np.float64)
+                        data = self._soft_limit(raw * self._play_gain).tobytes()
+                    stream.write(data)
                 self._keep_preloaded(get_next_song)
 
         finally:

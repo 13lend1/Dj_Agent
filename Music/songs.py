@@ -56,29 +56,29 @@ except Exception:
 #     "soul", "disco", "classical", "latin", "edm", "blues", "country",
 #     "metal", "punk", "ambient", "r&b", "indie",'rap'
 # ]
-GENRES=['house','techno','rock','hip-hop','pop','alt-pop','edm','metal','rap']
+GENRES=['house','techno','edm','electro-house','deep-house','dub techno','dubstep']
 ARTISTS = {
-    "Drake": "hip-hop", "Kendrick Lamar": "hip-hop", "Kanye West": "hip-hop",
-    "Jay-Z": "hip-hop", "50 Cent": "hip-hop", "Snoop Dogg": "hip-hop",
-    "Dr. Dre": "hip-hop", "Eminem": "hip-hop", "Post Malone": "hip-hop",
-    "Travis Scott": "hip-hop", "Mac Miller": "hip-hop", "Kid Cudi": "hip-hop",
-    "Cardi B": "hip-hop", "Megan Thee Stallion": "hip-hop",
+    # "Drake": "hip-hop", "Kendrick Lamar": "hip-hop", "Kanye West": "hip-hop",
+    # "Jay-Z": "hip-hop", "50 Cent": "hip-hop", "Snoop Dogg": "hip-hop",
+    # "Dr. Dre": "hip-hop", "Eminem": "hip-hop", "Post Malone": "hip-hop",
+    # "Travis Scott": "hip-hop", "Mac Miller": "hip-hop", "Kid Cudi": "hip-hop",
+    # "Cardi B": "hip-hop", "Megan Thee Stallion": "hip-hop",
 
-    "Taylor Swift": "pop", "Ariana Grande": "pop", "Dua Lipa": "pop",
-    "Ed Sheeran": "pop", "Billie Eilish": "pop", "Justin Bieber": "pop",
-    "Adele": "pop", "Sam Smith": "pop", "Lady Gaga": "pop", "Bruno Mars": "pop",
+    # "Taylor Swift": "pop", "Ariana Grande": "pop", "Dua Lipa": "pop",
+    # "Ed Sheeran": "pop", "Billie Eilish": "pop", "Justin Bieber": "pop",
+    # "Adele": "pop", "Sam Smith": "pop", "Lady Gaga": "pop", "Bruno Mars": "pop",
 
-    "The Weeknd": "r&b", "Rihanna": "r&b", "Frank Ocean": "r&b",
-    "SZA": "r&b", "Doja Cat": "r&b",
+    # "The Weeknd": "r&b", "Rihanna": "r&b", "Frank Ocean": "r&b",
+    # "SZA": "r&b", "Doja Cat": "r&b",
 
     "Calvin Harris": "edm", "David Guetta": "edm", "Tiësto": "edm",
     "Avicii": "edm", "Deadmau5": "edm", "Skrillex": "edm", "Marshmello": "edm",
     "Daft Punk": "edm",
 
-    "Metallica": "metal", "Nirvana": "rock", "Foo Fighters": "rock",
-    "Red Hot Chili Peppers": "rock", "Radiohead": "rock", "The Beatles": "rock",
-    "Queen": "rock", "Led Zeppelin": "rock", "Pink Floyd": "rock", "AC/DC": "rock",
-    "Arctic Monkeys": "indie", "The Strokes": "indie", "Tame Impala": "indie",
+    # "Metallica": "metal", "Nirvana": "rock", "Foo Fighters": "rock",
+    # "Red Hot Chili Peppers": "rock", "Radiohead": "rock", "The Beatles": "rock",
+    # "Queen": "rock", "Led Zeppelin": "rock", "Pink Floyd": "rock", "AC/DC": "rock",
+    # "Arctic Monkeys": "indie", "The Strokes": "indie", "Tame Impala": "indie",
 
     # "Miles Davis": "jazz", "John Coltrane": "jazz", "Louis Armstrong": "jazz",
     # "Ella Fitzgerald": "jazz", "Nina Simone": "jazz",
@@ -87,8 +87,8 @@ ARTISTS = {
     # "Stevie Wonder": "soul", "Marvin Gaye": "soul", "Aretha Franklin": "soul",
     # "James Brown": "funk", "Earth, Wind & Fire": "funk",
 
-    "Daddy Yankee": "latin", "Shakira": "latin", "J Balvin": "latin",
-    "Karol G": "latin", "Rosalía": "latin",
+    # "Daddy Yankee": "latin", "Shakira": "latin", "J Balvin": "latin",
+    # "Karol G": "latin", "Rosalía": "latin",
 
     # "Frédéric Chopin": "classical", "Ludwig van Beethoven": "classical",
     # "Wolfgang Amadeus Mozart": "classical", "Johann Sebastian Bach": "classical",

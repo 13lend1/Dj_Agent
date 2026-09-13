@@ -6,7 +6,7 @@ from dotenv import load_dotenv
 from google import genai
 from google.genai import types
 load_dotenv()
-GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.7-flash")
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.6flash")
 GEMINI_MIN_INTERVAL = 20.0
 GEMINI_REQUEST_TIMEOUT = 45.0
 _GEMINI_LOCK = threading.Lock()
@@ -55,6 +55,7 @@ _QUEUE_SCHEMA = {
                     "id": {"type": "string"},
                     "hook_start_sec": {"type": "number"},
                     "hook_end_sec": {"type": "number"},
+                    "clip_length_sec": {"type": "number"},
                     "transition_type": {
                         "type": "string",
                         "enum": ["beatmatched_crossfade", "crossfade"],
@@ -94,7 +95,7 @@ _QUEUE_SCHEMA = {
                         ],
                     },
                 },
-                "required": ["id", "hook_start_sec", "hook_end_sec"],
+                "required": ["id", "hook_start_sec", "hook_end_sec", "clip_length_sec"],
             },
         }
     },
@@ -176,7 +177,7 @@ class Agent:
             return []
         by_id = {str(song.get("id")): song for song in songs}
         try:
-            queue = self._query_gemini(songs=songs, previous=previous, clip_length=None)
+            queue = self._query_gemini(songs=songs, previous=previous)
         except Exception as exc:
             print(
                 f"[Agent] Gemini ordering failed, " f"returning original order: {exc}"
@@ -217,7 +218,9 @@ class Agent:
         current:
             Currently playing song. If omitted, self._last is used.
         clip_length:
-            Desired clip length in seconds.
+            Fallback clip length in seconds, used only when Gemini does
+            not return a clip_length_sec for a song or returns no valid
+            hook (default 33).
         Returns
         -------
         list[dict]
@@ -254,9 +257,10 @@ class Agent:
             return []
         try:
             clip_length = float(clip_length)
-        except TypeError, ValueError:
+        except (TypeError, ValueError):
             clip_length = 33.0
         clip_length = max(1.0, clip_length)
+
 
         def _norm_id(value):
             return str(value or "").strip()
@@ -264,7 +268,7 @@ class Agent:
         by_id = {_norm_id(song.get("id")): song for song in songs}
         try:
             queue = self._query_gemini(
-                songs=songs, previous=previous, clip_length=clip_length
+                songs=songs, previous=previous
             )
         except Exception as exc:
             print(
@@ -318,8 +322,26 @@ class Agent:
                 song["_gemini_transition"] = None
                 playlist.append(song)
         self._finalize_transitions(playlist, previous=previous)
+        self._save_response(playlist)
         return playlist
-    def _query_gemini(self, songs, previous, clip_length):
+    def _save_response(self, playlist):
+        """Persist every completed agent response to the Agent table.
+
+        Stores the ordered songs, the transitions between them, the hook
+        windows and the raw payload, exactly as returned. Saving must never
+        break playlist generation, so a DB error is logged and swallowed.
+        """
+        try:
+            from DJ.responses import save_response
+        except ImportError:
+            from responses import save_response
+        try:
+            run_id = save_response(playlist)
+            if run_id:
+                print(f"[Agent] Saved response {run_id} ({len(playlist)} songs).")
+        except Exception as exc:
+            print(f"[Agent] Could not save response: {exc}")
+    def _query_gemini(self, songs, previous):
         """
         Make exactly one Gemini request.
         Gemini returns:
@@ -337,7 +359,7 @@ class Agent:
         """
         _gemini_throttle()
         prompt = self._build_prompt(
-            songs=songs, previous=previous, clip_length=clip_length
+            songs=songs, previous=previous
         )
         last_exc = None
         for attempt in range(3):
@@ -386,161 +408,142 @@ class Agent:
                     )
                     time.sleep(delay)
         raise last_exc
-    def _build_prompt(self, songs, previous, clip_length):
-        """
-        Build the DJ prompt.
-        Gemini is explicitly told that it is responsible for:
-            ORDER
-            HOOK
-            TRANSITIONS
-        The song name and artist are included because Gemini can use
-        its knowledge of the actual songs to identify likely choruses,
-        drops, hooks, etc.
-        """
+    def _build_prompt(self, songs, previous):
         lines = []
-        lines.append("You are an expert professional DJ and music selector.")
-        lines.append("You are building one continuous DJ set.")
+        lines.append("You are an expert DJ building one continuous set.")
         lines.append("")
         if previous:
-            lines.append("CURRENTLY PLAYING:")
-            lines.append(f"  {self._desc(previous)}")
-            lines.append("The first candidate must flow naturally " "out of this song.")
+            lines.append(f"CURRENTLY PLAYING: {self._desc(previous)}")
+            lines.append("The first candidate must flow naturally out of this.")
         else:
-            lines.append("There is no currently playing song.")
+            lines.append("No song is currently playing.")
         lines.append("")
         lines.append("CANDIDATE SONGS:")
+        lines.append(
+            "(BPM/energy/danceability/valence/acousticness/instrumentalness "
+            "below are averaged over the WHOLE song, not just the hook — the "
+            "hook itself may feel more/less intense than these numbers suggest. "
+            "Use your own knowledge of the song to judge the hook's actual "
+            "character when ordering and matching transitions.)"
+        )
         for index, song in enumerate(songs, start=1):
             lines.append(f"{index}. [id: {song.get('id')}] {self._desc(song)}")
         lines.append("")
-        lines.append("Return the EXACT bracketed [id: ...] of each song "
-                     "you include in the queue.")
-        lines.append("Your job is to create the best possible DJ sequence.")
-        lines.append("You must make THREE decisions:")
-        lines.append("1. ORDER the songs.")
-        lines.append("2. SELECT the best hook/playable section " "of every song.")
-        lines.append("3. SELECT the transition from every song " "into the next song.")
-        lines.append("")
-        lines.append("SONG ORDER:")
-        lines.append("- Do not simply preserve the input order.")
-        lines.append("- Choose the order that creates the best " "continuous DJ flow.")
-        lines.append("- Consider BPM compatibility.")
-        lines.append("- Consider energy progression.")
-        lines.append("- Consider danceability.")
-        lines.append("- Consider valence and overall mood.")
-        lines.append("- Consider genre/style compatibility.")
-        lines.append("- Avoid unnecessary BPM cliffs.")
         lines.append(
-            "- An intentional energy jump is allowed " "when it sounds musically good."
+            "Return the EXACT bracketed [id: ...] for each song. You must: "
+            "(1) order the songs, (2) pick each song's hook window, "
+            "(3) pick the transition into the next song."
         )
         lines.append("")
-        lines.append("BPM / MIXING:")
-        lines.append("- Prefer consecutive songs with compatible BPM.")
+        lines.append("SET ARC:")
         lines.append(
-            "- A difference of around 0-8 BPM is generally " "easy to beatmatch."
+            "First state a one-line energy trajectory for the whole set "
+            "(e.g. steady build, warm-up->peak->cooldown, peak-early->sustain) "
+            "in `set_arc`. Order songs to follow it — don't just optimize "
+            "each adjacent pair in isolation."
+        )
+        lines.append("")
+        lines.append("ORDERING:")
+        lines.append(
+            "Don't preserve input order. Sequence for BPM compatibility, "
+            "energy progression, danceability, valence/mood, and genre fit."
         )
         lines.append(
-            "- 8-15 BPM can work with a shorter crossfade " "or creative transition."
+            "Group songs into clusters of similar genre/mood/BPM range where "
+            "possible, and move between clusters at natural arc transition "
+            "points (e.g. build->peak, peak->cooldown) rather than bouncing "
+            "back and forth between styles multiple times in one set."
         )
         lines.append(
-            "- Larger BPM differences should normally use " "a short transition."
+            "Avoid unnecessary BPM cliffs; an intentional jump is fine if it "
+            "serves the music. ~0-8 BPM diff mixes easily, 8-15 needs a "
+            "shorter/creative transition, larger diffs should use a short cut."
+        )
+        lines.append(
+            "Avoid jagged energy (up-down-up-down); each phase of the arc "
+            "should move mostly in one direction, with at most one deliberate "
+            "contrast moment per phase if it serves the music."
+        )
+        lines.append(
+            "A candidate does NOT have to be used. If a song doesn't fit "
+            "anywhere in the set without hurting flow (BPM/key/genre clash, "
+            "breaks the arc, no clean transition in or out), leave it out "
+            "rather than forcing it in. Prefer a slightly shorter but "
+            "consistently smooth set over including every candidate."
         )
         lines.append("")
         lines.append("HOOK SELECTION:")
         lines.append(
-            f"Each song should have approximately "
-            f"{clip_length:.0f} seconds of playable material."
-        )
-        lines.append("Return hook_start_sec and hook_end_sec.")
-        lines.append(
-            "The hook should be the most exciting and " "recognizable part of the song."
+            "Return hook_start_sec/hook_end_sec: the actual most-played/"
+            "most-replayed section (chorus, drop, or strongest part), using "
+            "your knowledge of the song. No fixed target length — use the "
+            "section's real span. Avoid intro/outro unless it's genuinely the iconic part."
         )
         lines.append(
-            "Prefer a chorus, drop, main hook, memorable "
-            "vocal section, or strongest musical section."
+            "Choose boundaries WITH the rest of the sequence in mind, not "
+            "each song in isolation: hook_end_sec of a song should land on "
+            "material whose energy/intensity is close to the hook_start_sec "
+            "of the next song, so the splice point itself is a smooth match, "
+            "not just each song's best moment picked independently. If the "
+            "single 'best' window would create a jarring jump into the next "
+            "song's opening, shift the boundary slightly (earlier/later, "
+            "still inside the real hook/decay region) to smooth that specific "
+            "handoff."
         )
         lines.append(
-            "Do NOT choose the intro unless the intro itself "
-            "is clearly the iconic/strongest section."
+            "End a few seconds into the decay/sustain after the peak, not "
+            "exactly on it, so the transition has material to fade over — "
+            "unless the transition is a hard-cut effect (vinyl_stop/"
+            "tape_stop/scratch)."
         )
+        lines.append("")
+        lines.append("CLIP LENGTH (clip_length_sec):")
         lines.append(
-            "Do NOT choose the outro unless it is musically "
-            "important and useful for mixing."
-        )
-        lines.append(
-            "Use your knowledge of the actual song from "
-            "its title and artist when deciding where the "
-            "chorus/drop/hook occurs."
-        )
-        lines.append("The hook must remain inside the song duration.")
-        lines.append(
-            "Return the ACTUAL strongest musical window - "
-            "typically 12 to 30 seconds of one full phrase. "
-            "Do NOT force a fixed length; the clip length is "
-            "simply hook_end_sec minus hook_start_sec and "
-            "should match whichever section carries the hook."
+            "Return clip_length_sec per song: how many seconds that song "
+            "actually plays on the floor. This is the authoritative play "
+            "time — vary it so it is NOT the same for every song. Follow "
+            "the set arc: short/quick cuts ~15-25s for warm-up or cooldown "
+            "rests, steady 25-45s for mid-set momentum, and 45-90s for "
+            "peak/top-momentum songs so the crowd stays on the peak. "
+            "It should roughly match hook_end_sec - hook_start_sec, and "
+            "must stay inside the song's duration (you know each song's "
+            "duration from the candidate list)."
         )
         lines.append("")
         lines.append("TRANSITIONS:")
-        lines.append("You MUST choose a transition for EVERY " "consecutive pair.")
-        if previous and songs:
-            lines.append(
-                "This includes the transition from the "
-                "CURRENTLY PLAYING song into the first "
-                "candidate."
-            )
-        lines.append("For example:")
-        lines.append("Song A -> Song B")
-        lines.append("Song B -> Song C")
-        lines.append("Song C -> Song D")
-        lines.append("Every one of these must have a transition.")
-        lines.append("")
-        lines.append("Use transition_type:")
         lines.append(
-            "- beatmatched_crossfade when BPMs are "
-            "compatible and both songs can be blended."
+            "Every consecutive pair needs a transition, including CURRENTLY "
+            "PLAYING -> first candidate if applicable."
         )
-        lines.append("- crossfade when beatmatching is not appropriate.")
-        lines.append("")
-        lines.append("crossfade_bars is the number of musical bars.")
-        lines.append("Use approximately:")
-        lines.append("- 2 bars for a smooth beatmatched transition.")
-        lines.append("- 1 bar for a tighter transition.")
-        lines.append("- 0.5 bars for a short blend.")
-        lines.append("- 0.25 bars for a very quick transition.")
-        lines.append("")
-        lines.append("transition_note:")
-        lines.append("Describe WHAT musical element should carry " "the transition.")
-        lines.append("Examples include:")
-        lines.append("- drums")
-        lines.append("- bassline")
-        lines.append("- hi-hats")
-        lines.append("- vocal phrase")
-        lines.append("- chorus")
-        lines.append("- drop")
-        lines.append("- percussion")
+        lines.append(
+            "IMPORTANT: attach the transition to the song being ENTERED, not "
+            "the song ending. That is, song X's transition_type/crossfade_bars/"
+            "transition_note/effect describe how the set moves INTO song X "
+            "from whatever plays immediately before it — not how X transitions "
+            "into whatever comes after it. The first candidate's fields "
+            "describe the transition from CURRENTLY PLAYING into it."
+        )
+        lines.append(
+            "Use beatmatched_crossfade when BPMs are compatible, else crossfade. "
+            "crossfade_bars: 2=smooth, 1=tight, 0.5=short, 0.25=very quick. "
+            "transition_note names the carrying element (drums, bassline, "
+            "hi-hats, vocal phrase, chorus, drop, percussion)."
+        )
         lines.append("")
         lines.append("EFFECTS:")
-        lines.append("Use effects sparingly.")
-        lines.append("Most normal transitions should use 'none'.")
-        lines.append("Use risers for builds.")
-        lines.append("Use impacts for drops or large energy changes.")
-        lines.append("Use sweeps for smooth transitions.")
         lines.append(
-            "Use vinyl_stop/tape_stop/scratch only for " "intentional dramatic changes."
+            "Default 'none'. Riser for builds, impact for drops/big energy "
+            "changes, sweep for smooth transitions, vinyl_stop/tape_stop/"
+            "scratch only for intentional dramatic breaks."
         )
         lines.append("")
-        lines.append("OUTPUT RULES:")
-        lines.append("Return every candidate exactly once.")
-        lines.append("Do not invent IDs.")
-        lines.append("The queue order IS the DJ order.")
         lines.append(
-            "hook_start_sec and hook_end_sec must be valid "
-            "timestamps inside each song."
+            "Only return IDs from the candidate list, no invented IDs, and "
+            "no duplicates. It is fine to omit a candidate if it doesn't fit "
+            "the set — do not force in a song just to include every candidate. "
+            "hook_start_sec/hook_end_sec must be valid timestamps inside "
+            "the song. The last song needs no outgoing transition."
         )
-        lines.append(
-            "Return a transition for every song that has " "another song after it."
-        )
-        lines.append("The final song does not need an outgoing transition.")
         return "\n".join(lines)
     @staticmethod
     def _desc(song):
@@ -553,17 +556,17 @@ class Agent:
         duration_ms = song.get("duration") or 0
         try:
             duration_sec = float(duration_ms) / 1000.0
-        except TypeError, ValueError:
+        except (TypeError, ValueError):
             duration_sec = 0.0
         def num(value, decimals=2):
             try:
                 return f"{float(value):.{decimals}f}"
-            except TypeError, ValueError:
+            except (TypeError, ValueError):
                 return "?"
         bpm = song.get("bpm")
         try:
             bpm_text = f"{float(bpm):.1f}"
-        except TypeError, ValueError:
+        except (TypeError, ValueError):
             bpm_text = "?"
         return (
             f"{name} by {artist} | "
@@ -577,20 +580,11 @@ class Agent:
             f"genre {song.get('genre') or '?'}"
         )
     def _resolve_hook(self, song, entry, clip_length):
-        """
-        Validate Gemini's hook WITHOUT rewriting it to a fixed length.
-        Gemini's hook_start_sec/hook_end_sec become the clip as-is, so the
-        clip length is simply hook_end - hook_start and varies per song.
-        Only sanity guards apply: clip must stay inside the song and length
-        is clamped to a reasonable [MIN, MAX] band (MAX defaults to the
-        requested clip_length so playback never gets a 3-minute hook).
-        If Gemini returns no valid hook, fall back to _clip_window.
-        """
         duration_sec = self._duration_seconds(song)
         try:
             start = float(entry.get("hook_start_sec"))
             end = float(entry.get("hook_end_sec"))
-        except TypeError, ValueError:
+        except (TypeError, ValueError):
             return self._clip_window(song, clip_length)
         if start < 0 or end <= start:
             return self._clip_window(song, clip_length)
@@ -599,11 +593,9 @@ class Agent:
             end = min(end, duration_sec)
             if end <= start:
                 return self._clip_window(song, clip_length)
+
         min_len = 8.0
-        try:
-            max_len = max(min_len, float(clip_length))
-        except TypeError, ValueError:
-            max_len = 30.0
+        max_len = 90.0  # was `clip_length` (default 33) — too low for peak-arc hooks
         span = end - start
         if span < min_len:
             if duration_sec > 0 and start + min_len <= duration_sec:
@@ -617,6 +609,21 @@ class Agent:
                 end = duration_sec
                 start = max(0.0, end - max_len)
         return (round(start, 1), round(end, 1))
+    def _entry_clip_length(self, entry, fallback):
+        """
+        Extract Gemini's authoritative clip_length_sec for a song.
+        Returns None when Gemini did not provide a usable value so the
+        caller can fall back to the requested clip_length (default 33s).
+        The value is clamped to a sane DJ band so a bad model value can
+        never produce a zero- or multi-minute clip.
+        """
+        try:
+            length = float(entry.get("clip_length_sec"))
+        except (TypeError, ValueError):
+            return None
+        if length < 1.0:
+            return None
+        return max(8.0, min(length, 90.0))
     def _clip_window(self, song, clip_length):
         """
         Safety fallback when Gemini does not provide a valid hook.
@@ -639,7 +646,7 @@ class Agent:
                         start = max(0.0, min(start, duration))
                         end = max(start, min(end, duration))
                     return (round(start, 1), round(end, 1))
-            except TypeError, ValueError:
+            except (TypeError, ValueError):
                 pass
         if duration <= 0:
             return (0.0, round(desired_length, 1))
@@ -656,7 +663,7 @@ class Agent:
         duration = song.get("duration") or 0
         try:
             return max(0.0, float(duration) / 1000.0)
-        except TypeError, ValueError:
+        except (TypeError, ValueError):
             return 0.0
     def _finalize_transitions(self, playlist, previous=None):
         """
@@ -711,7 +718,7 @@ class Agent:
             return False
         try:
             bars = float(bars)
-        except TypeError, ValueError:
+        except (TypeError, ValueError):
             return False
         return bars > 0
     def _make_transition(self, song_a, song_b, gem):
@@ -726,7 +733,7 @@ class Agent:
             transition_type = gem.get("type")
             try:
                 bars = float(gem.get("crossfade_bars"))
-            except TypeError, ValueError:
+            except (TypeError, ValueError):
                 bars = 1.0
             bars = max(0.25, min(bars, 4.0))
             bpm_a = self._number(song_a.get("bpm"), 0.0)
@@ -827,7 +834,7 @@ class Agent:
         """
         try:
             bpm = float(bpm)
-        except TypeError, ValueError:
+        except (TypeError, ValueError):
             bpm = 120.0
         if bpm <= 0:
             bpm = 120.0
@@ -839,7 +846,7 @@ class Agent:
         """
         try:
             bars = float(bars)
-        except TypeError, ValueError:
+        except (TypeError, ValueError):
             bars = 1.0
         bars = max(0.25, bars)
         bpms = []
@@ -848,14 +855,14 @@ class Agent:
                 bpm = float(bpm)
                 if bpm > 0:
                     bpms.append(bpm)
-            except TypeError, ValueError:
+            except (TypeError, ValueError):
                 pass
         if bpms:
             avg_bpm = sum(bpms) / len(bpms)
         else:
             avg_bpm = 120.0
         seconds = bars * self._bar_seconds(avg_bpm)
-        seconds = max(1.0, min(seconds, 16.0))
+        seconds = max(0.15, min(seconds, 16.0))  # was max(1.0, ...) — was erasing all quick transitions
         return round(seconds, 1)
     @staticmethod
     def _pick_fallback_effect(transition_type, bpm_diff, energy_diff):
@@ -912,7 +919,7 @@ class Agent:
         """
         try:
             return float(value)
-        except TypeError, ValueError:
+        except (TypeError, ValueError):
             return default
     @staticmethod
     def _fmt(seconds):
@@ -921,7 +928,7 @@ class Agent:
         """
         try:
             seconds = max(0, int(seconds))
-        except TypeError, ValueError:
+        except (TypeError, ValueError):
             seconds = 0
         minutes, seconds = divmod(seconds, 60)
         return f"{minutes}:{seconds:02d}"

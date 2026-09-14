@@ -57,7 +57,25 @@ except Exception:
 #     "metal", "punk", "ambient", "r&b", "indie",'rap'
 # ]
 # 'house','techno','edm','electro-house','deep-house','dub techno','dubstep'
-GENRES=['house','techno','edm','electro-house','deep-house','dub techno','dubstep']
+GENRES= [
+    "ambient",
+    "downtempo",
+    "chillout",
+    "lounge",
+    "dreampop",
+    "jazz",
+    "latin jazz",
+    "bossa-nova",
+    "neo-soul",
+    "motown",
+    "folk",
+    "ork-pop",
+    "funk",
+    "disco",
+    "pop",
+    "easy listening",
+    "classical",
+]
 ARTISTS = {
     # "Drake": "hip-hop", "Kendrick Lamar": "hip-hop", "Kanye West": "hip-hop",
     # "Jay-Z": "hip-hop", "50 Cent": "hip-hop", "Snoop Dogg": "hip-hop",

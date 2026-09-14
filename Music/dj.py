@@ -528,6 +528,8 @@ class DJ(PreloadedPlayer):
         # would fight the pump thread for the same pipe.
         try:
             probe = self._read_chunk(out_process, timeout=15.0)
+            if probe is None:          # stalling, not ended: fade treats it as silent
+                probe = b""
         except (OSError, ValueError):
             probe = b""
         probe = probe[:len(probe) // 4 * 4]
@@ -551,11 +553,15 @@ class DJ(PreloadedPlayer):
                 first_iter = False
             else:
                 try:
-                   a = self._read_chunk(out_process, timeout=15.0)  
+                   a = self._read_chunk(out_process, timeout=15.0)
+                   if a is None:
+                       a = b""
                 except (OSError, ValueError):
                     a = b""
             try:
                b = self._read_chunk(in_process, timeout=15.0)
+               if b is None:
+                   b = b""
             except (OSError, ValueError):
                 b = b""
 
@@ -893,9 +899,20 @@ class DJ(PreloadedPlayer):
                         continue
 
                 try:
-                    data = self._read_chunk(current, timeout=15.0)          # was current.stdout.read(...)
+                    data = self._read_chunk(current, timeout=15.0)
                 except (OSError, ValueError):
                     data = b""
+
+                if data is None:
+                    # Producer is alive but quiet (buffering / network stall).
+                    # This is NOT the end of the song: keep this song on deck
+                    # and wait rather than advancing. Giving up here is what
+                    # made slow streams get skipped a few seconds in.
+                    if self.stop_event.is_set():
+                        break
+                    self._keep_preloaded(get_next_song)
+                    time.sleep(0.25)
+                    continue
 
                 if not data:
 
@@ -1007,14 +1024,26 @@ class DJ(PreloadedPlayer):
         return q
 
     def _read_chunk(self, process, timeout=15.0):
-        """b"" on real EOF AND on a stall (no bytes within `timeout`s) — callers
-        already treat b"" as 'this song is done, advance', which is exactly
-        the right behavior for a dead stream too."""
+        """Returns audio bytes, ``b""`` for a REAL end-of-stream, or ``None``
+        when the producer is STILL ALIVE but quiet (network buffering/stall).
+
+        Callers must only treat ``b""`` as 'this song is done, advance'. A
+        silent-but-alive stream is not the end — conflating the two made a
+        buffer hiccup skip songs (and could cascade)."""
         q = self._reader_queue(process)
         try:
             return q.get(timeout=timeout)
         except _q.Empty:
-            print("Stream stalled — treating as ended.", flush=True)
+            if self._readers.get(process) is q:
+                # The pump thread is still alive on this pipe: the song hasn't
+                # ended, its stream is just not delivering bytes right now.
+                if not getattr(q, '_stall_shown', False):
+                    q._stall_shown = True
+                    print("Buffering — waiting for stream data...", flush=True)
+                return None
+            # The pump already exited: it queued a b"" EOF marker (real end)
+            # before its own cleanup, or gave up on an abandoned stream.
+            # Either way this stream is done.
             return b""
 
     @staticmethod

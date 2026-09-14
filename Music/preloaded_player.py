@@ -78,6 +78,7 @@ class PreloadedPlayer(Player):
 
                 wait_start = time.time()
                 last_print = 0
+                max_wait = 90.0  # hard cap: never wait forever for a tiny pool
 
                 # Don't stall playback waiting for a full pool: the first batch
                 # can start as soon as enough candidates to fill top_n exist,
@@ -93,6 +94,10 @@ class PreloadedPlayer(Player):
                     if count >= min_needed:
                         break
                     if now - wait_start > 45 and count >= 3:
+                        break
+                    if now - wait_start > max_wait:
+                        print("Pool stayed too small — building a smaller batch "
+                              "from what exists.")
                         break
                     time.sleep(check_interval)
 

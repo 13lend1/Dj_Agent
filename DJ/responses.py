@@ -25,10 +25,14 @@ def create_agent_table():
                 songs_json TEXT,
                 transitions_json TEXT,
                 hooks_json TEXT,
-                raw_json TEXT
+                raw_json TEXT,
+                played TEXT
             )
             """
         )
+        cols = {row[1] for row in conn.execute("PRAGMA table_info(Agent)").fetchall()}
+        if "played" not in cols:
+            conn.execute("ALTER TABLE Agent ADD COLUMN played TEXT")
 
 
 def save_response(response):
@@ -97,8 +101,8 @@ def save_response(response):
         conn.execute(
             """
             INSERT OR REPLACE INTO Agent
-                (id, name, created_at, songs_json, transitions_json, hooks_json, raw_json)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+                (id, name, created_at, songs_json, transitions_json, hooks_json, raw_json, played)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 run_id,
@@ -108,9 +112,136 @@ def save_response(response):
                 json.dumps(transitions, default=str),
                 json.dumps(hooks, default=str),
                 json.dumps(playlist, default=str),
+                "unplayed",
             ),
         )
         return run_id
+
+
+def last_run_songs():
+    """Return (run_id, songs) for the most recent Agent run, or (None, []) when
+    nothing has been saved yet. Songs come back in play order, each carrying a
+    ``played`` flag derived from the row's ``played`` column (a JSON list of
+    song IDs that have finished playing start-to-end).
+
+    Runs without a ``played`` column (created before the column was added)
+    are treated as all-unplayed, so the DJ resumes the full set.
+    """
+    from Music.songs import DB_LOCK, _get_conn
+
+    create_agent_table()
+    with DB_LOCK:
+        conn = _get_conn()
+        row = conn.execute(
+            "SELECT id, songs_json, played FROM Agent ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+    if row is None:
+        return None, []
+
+    run_id, text, played_text = row
+    try:
+        songs = json.loads(text)
+    except Exception:
+        return run_id, []
+    if not isinstance(songs, list):
+        return run_id, []
+
+    # The played column accepts:
+    #   'played'   -> every song in this run counts as played
+    #   'unplayed' / NULL -> nothing played yet
+    #   JSON list  -> ids of the individual songs already played
+    raw = played_text
+    if raw is None or str(raw).strip().lower() == "unplayed":
+        played_ids = set()
+    elif str(raw).strip().lower() == "played":
+        played_ids = "ALL"
+    else:
+        try:
+            played_ids = set(json.loads(raw))
+        except Exception:
+            played_ids = set()
+        if not isinstance(played_ids, set):
+            played_ids = set()
+
+    for song in songs:
+        if isinstance(song, dict):
+            song["played"] = (
+                True if played_ids == "ALL"
+                else (str(song.get("id") or "") in played_ids)
+            )
+
+    return run_id, songs
+
+
+def mark_song_played(song_id):
+    """Flag a song as played in EVERY Agent run that contains it.
+
+    A run's ``played`` column is only reliable if marks land in the run the
+    song actually belongs to, not just the newest one: as new batches (new
+    runs) are created while older sets still play, flags previously drifted to
+    the newest row and older runs were left looking unplayed.
+
+    The column can hold:
+        'played'   -> every song in the run finished start-to-end
+        'unplayed' / NULL -> nothing flagged yet
+        JSON list  -> ids flagged so far (partial set)
+
+    When the last unplayed song of a run is flagged, that run flips to
+    'played'.  Returns True when any row was updated, False otherwise.  Never
+    raises for a bad / missing song id."""
+    from Music.songs import DB_LOCK, _get_conn
+
+    song_id = str(song_id or "").strip()
+    if not song_id:
+        return False
+
+    create_agent_table()
+    updated = False
+    with DB_LOCK:
+        conn = _get_conn()
+        rows = conn.execute("SELECT id, songs_json, played FROM Agent").fetchall()
+        for run_id, songs_text, played_text in rows:
+            # Fast path: a run flagged as fully played can never contain an
+            # unplayed song, so skip it before the (growing) songs_json parse.
+            # This keeps mark_song_played cheap as the Agent table accumulates
+            # completed runs over long sessions.
+            if played_text is not None and str(played_text).strip().lower() == "played":
+                continue
+            try:
+                songs = json.loads(songs_text)
+            except Exception:
+                continue
+            if not isinstance(songs, list):
+                continue
+
+            run_ids = [str(s.get("id") or "") for s in songs if isinstance(s, dict)]
+            if song_id not in run_ids:
+                continue
+
+            raw = played_text
+            if raw is None or str(raw).strip().lower() == "unplayed":
+                played = []
+            else:
+                try:
+                    played = list(json.loads(raw))
+                except Exception:
+                    played = []
+                if not isinstance(played, list):
+                    played = []
+            if song_id in played:
+                continue
+
+            played.append(song_id)
+            updated = True
+            if len(played) >= len(run_ids):  # every song in this run has played
+                conn.execute("UPDATE Agent SET played = 'played' WHERE id = ?",
+                             (run_id,))
+            else:
+                conn.execute(
+                    "UPDATE Agent SET played = ? WHERE id = ?",
+                    (json.dumps(played, default=str), run_id),
+                )
+    return updated
 
 
 def debug_response(run_id=None):

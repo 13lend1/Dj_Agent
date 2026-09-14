@@ -6,8 +6,8 @@ from dotenv import load_dotenv
 from google import genai
 from google.genai import types
 load_dotenv()
-GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.6flash")
-GEMINI_MIN_INTERVAL = 20.0
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.1-flash-lite")
+GEMINI_MIN_INTERVAL = 10.0
 GEMINI_REQUEST_TIMEOUT = 45.0
 _GEMINI_LOCK = threading.Lock()
 _GEMINI_LAST_CALL = 0.0
@@ -55,7 +55,7 @@ _QUEUE_SCHEMA = {
                     "id": {"type": "string"},
                     "hook_start_sec": {"type": "number"},
                     "hook_end_sec": {"type": "number"},
-                    "clip_length_sec": {"type": "number"},
+                    # "clip_length_sec": {"type": "number"},
                     "transition_type": {
                         "type": "string",
                         "enum": ["beatmatched_crossfade", "crossfade"],
@@ -95,7 +95,7 @@ _QUEUE_SCHEMA = {
                         ],
                     },
                 },
-                "required": ["id", "hook_start_sec", "hook_end_sec", "clip_length_sec"],
+                "required": ["id", "hook_start_sec", "hook_end_sec"],
             },
         }
     },
@@ -104,6 +104,30 @@ _QUEUE_SCHEMA = {
 _EFFECT_NAMES = set(
     _QUEUE_SCHEMA["properties"]["queue"]["items"]["properties"]["effect"]["enum"]
 )
+_HOOK_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "hooks": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "id": {"type": "string"},
+                    "hook_start_sec": {"type": "number"},
+                    "hook_end_sec": {"type": "number"},
+                },
+                "required": ["id", "hook_start_sec", "hook_end_sec"],
+            },
+        }
+    },
+    "required": ["hooks"],
+}
+
+
+def _norm_sid(value):
+    """Normalize a song id for cross-referencing Gemini entries (the ids are
+    UUIDs/YouTube ids, so whitespace-only or None never matches a song)."""
+    return str(value or "").strip()
 class Agent:
     """
     AI DJ agent.
@@ -262,10 +286,7 @@ class Agent:
         clip_length = max(1.0, clip_length)
 
 
-        def _norm_id(value):
-            return str(value or "").strip()
-
-        by_id = {_norm_id(song.get("id")): song for song in songs}
+        by_id = {_norm_sid(song.get("id")): song for song in songs}
         try:
             queue = self._query_gemini(
                 songs=songs, previous=previous
@@ -277,20 +298,63 @@ class Agent:
                 f"{exc}"
             )
             queue = []
-        playlist = []
-        seen_ids = set()
+        # Deduplicate Gemini's queue into play order; the songs Gemini decided
+        # to leave out are appended afterwards (order still follows Gemini's
+        # set, those songs just join in input order at the tail).
+        ordered_entries = []
+        used_ids = set()
         for entry in queue:
-            song_id = _norm_id(entry.get("id"))
-            song = by_id.get(song_id)
-            if song is None:
+            song_id = _norm_sid(entry.get("id"))
+            if song_id not in by_id or song_id in used_ids:
                 continue
-            if song_id in seen_ids:
-                continue
-            seen_ids.add(song_id)
-            song = self._validate(dict(song))
-            start, end = self._resolve_hook(
+            used_ids.add(song_id)
+            ordered_entries.append(entry)
+        missing_songs = [song for song in songs
+                         if _norm_sid(song.get("id")) not in used_ids]
+
+        # Gemini sometimes skips the hook fields (null / zero-length / out of
+        # range) even though the schema asks for them. Collect every song that
+        # ended up without a usable hook and ask Gemini once more, ONLY for
+        # windows. Whatever it is still unsure about falls back to the middle
+        # section, exactly as before.
+        repair_needed = []
+        for entry in ordered_entries:
+            song = self._validate(dict(by_id[_norm_sid(entry.get("id"))]))
+            _, _, fallback = self._resolve_hook(
                 song=song, entry=entry, clip_length=clip_length
             )
+            if fallback:
+                repair_needed.append(song)
+        for original_song in missing_songs:
+            repair_needed.append(self._validate(dict(original_song)))
+        repairs = self._request_hooks(repair_needed) if repair_needed else {}
+        if len(repairs):
+            print(
+                f"[Agent] Gemini hook repair recovered real hooks for "
+                f"{len(repairs)} song(s)."
+            )
+
+        def _fused_entry(entry, song_id):
+            """Prefer the repaired window over the original Gemini window."""
+            fused = dict(entry)
+            window = repairs.get(song_id)
+            if window:
+                fused["hook_start_sec"] = window["hook_start_sec"]
+                fused["hook_end_sec"] = window["hook_end_sec"]
+            return fused
+
+        playlist = []
+        fallback_count = 0
+        for entry in ordered_entries:
+            song_id = _norm_sid(entry.get("id"))
+            song = self._validate(dict(by_id[song_id]))
+            fused = _fused_entry(entry, song_id)
+            start, end, fallback = self._resolve_hook(
+                song=song, entry=fused, clip_length=clip_length
+            )
+            if fallback:
+                fallback_count += 1
+                self._print_fallback(song, clip_length)
             song["play_start_sec"] = start
             song["play_end_sec"] = end
             song["play_start"] = self._fmt(start)
@@ -303,17 +367,26 @@ class Agent:
                 "effect": entry.get("effect") or "none",
             }
             playlist.append(song)
-        missing = [song for song in songs if _norm_id(song.get("id")) not in seen_ids]
-        if missing:
+        if missing_songs:
             if queue:
                 print(
                     f"[Agent] Gemini omitted "
-                    f"{len(missing)} song(s); "
+                    f"{len(missing_songs)} song(s); "
                     "appending them."
                 )
-            for original_song in missing:
+            for original_song in missing_songs:
                 song = self._validate(dict(original_song))
-                start, end = self._clip_window(song, clip_length)
+                fused = repairs.get(_norm_sid(song.get("id")))
+                if fused:
+                    start, end, fallback = self._resolve_hook(
+                        song=song, entry=fused, clip_length=clip_length
+                    )
+                else:
+                    start, end = self._clip_window(song, clip_length)
+                    fallback = True
+                if fallback:
+                    fallback_count += 1
+                    self._print_fallback(song, clip_length)
                 song["play_start_sec"] = start
                 song["play_end_sec"] = end
                 song["play_start"] = self._fmt(start)
@@ -321,6 +394,12 @@ class Agent:
                 song["clip_length"] = round(max(0.0, end - start), 1)
                 song["_gemini_transition"] = None
                 playlist.append(song)
+        if fallback_count:
+            print(
+                f"[hooks] {len(playlist) - fallback_count}/{len(playlist)} used "
+                f"Gemini hooks; {fallback_count}/{len(playlist)} fell back to the "
+                f"{clip_length:.1f}s fallback."
+            )
         self._finalize_transitions(playlist, previous=previous)
         self._save_response(playlist)
         return playlist
@@ -390,24 +469,119 @@ class Agent:
                 last_exc = exc
                 lower = str(exc).lower()
                 if "quota" in lower or "resource_exhausted" in lower:
-                    print(
-                        "[Agent] Gemini free-tier quota is exhausted "
-                        f"for today ({exc}); falling back to "
-                        "deterministic ordering."
-                    )
+                    print(f"[Gemini] Quota exhausted ({exc}); giving up on this set.")
                     raise exc
+                if "503" in str(exc) or "unavailable" in lower \
+                        or "overloaded" in lower or "busy" in lower:
+                    delay = 10.0  # flash is overloaded — needs the pause to recover
+                elif "429" in lower or "too many" in lower or "rate limit" in lower:
+                    delay = 20.0 * (attempt + 1)
+                else:
+                    delay = 5.0 * (attempt + 1)
                 if attempt < 2:
-                    lower = str(exc).lower()
-                    if "429" in lower or "too many" in lower or "rate limit" in lower:
-                        delay = 20.0 * (attempt + 1)
-                    else:
-                        delay = 5.0 * (attempt + 1)
-                    print(
-                        f"[Agent] Gemini call failed ({exc}); "
-                        f"retrying in {delay:.0f}s..."
-                    )
+                    print(f"[Gemini] Request failed ({exc}); retrying in {delay:.0f}s "
+                          f"(attempt {attempt + 2}/3)...")
                     time.sleep(delay)
         raise last_exc
+    def _request_hooks(self, songs):
+        """Targeted follow-up request for songs whose first-pass hook was
+        missing or unusable.
+
+        The main request orders songs AND picks hooks AND picks transitions in
+        one shot; structured output sometimes satisfies 'required' by emitting
+        null/zero windows instead of a real section. This second request asks
+        for ONLY the hook window of EVERY listed song (no ordering, no
+        transitions), which is far easier for the model to answer completely.
+
+        Returns {id: {"hook_start_sec": float, "hook_end_sec": float}} for the
+        songs Gemini answered with a valid in-range window, else {}.
+        """
+        if not songs:
+            return {}
+        _gemini_throttle()
+        prompt = self._build_hook_prompt(songs)
+        last_exc = None
+        for attempt in range(2):
+            try:
+                chat = self._client.chats.create(
+                    model=self._model,
+                    config=types.GenerateContentConfig(
+                        response_mime_type="application/json",
+                        response_schema=_HOOK_SCHEMA,
+                        temperature=0.2,
+                    ),
+                )
+                response = _gemini_request(
+                    lambda: chat.send_message(prompt), GEMINI_REQUEST_TIMEOUT
+                )
+                if response is None or not response.text:
+                    last_exc = GeminiEmptyResponse(
+                        "Gemini returned no data for the hook repair."
+                    )
+                    if attempt == 0:
+                        print(
+                            "[Gemini] Hook repair returned empty; retrying in 5s..."
+                        )
+                        time.sleep(5.0)
+                    continue
+                data = json.loads(response.text)
+                hooks = data.get("hooks") or []
+                windows = {}
+                for entry in hooks:
+                    song_id = _norm_sid(entry.get("id"))
+                    if not song_id:
+                        continue
+                    try:
+                        start = float(entry.get("hook_start_sec"))
+                        end = float(entry.get("hook_end_sec"))
+                    except (TypeError, ValueError):
+                        continue
+                    if start < 0 or end <= start:
+                        continue
+                    windows[song_id] = {
+                        "hook_start_sec": start,
+                        "hook_end_sec": end,
+                    }
+                return windows
+            except Exception as exc:
+                last_exc = exc
+                if attempt == 0:
+                    print(
+                        f"[Gemini] Hook repair failed ({exc}); retrying in 5s..."
+                    )
+                    time.sleep(5.0)
+        # The repair is best-effort: never let it kill playlist generation.
+        print(f"[Gemini] Hook repair gave up ({last_exc}); using fallbacks.")
+        return {}
+    def _build_hook_prompt(self, songs):
+        lines = []
+        lines.append("Return hook_start_sec/hook_end_sec for EVERY song below.")
+        lines.append("")
+        lines.append(
+            "These songs ALREADY belong together in one set — do not order "
+            "them, do not add transitions, ONLY give each one its strongest "
+            "playable window."
+        )
+        lines.append("")
+        lines.append(
+            "Rules: hook_start_sec/hook_end_sec must both be numbers INSIDE "
+            "the song's duration, hook_end_sec strictly greater than "
+            "hook_start_sec, never 0/0, never null, never negative. Windows "
+            "should be real musical passages (chorus, drop, build, climax, "
+            "solo, peak) and may vary in length per song."
+        )
+        lines.append("")
+        for index, song in enumerate(songs, start=1):
+            lines.append(
+                f"{index}. [id: {song.get('id')}] {self._desc(song)}"
+            )
+        lines.append("")
+        lines.append(
+            "Return the exact bracketed [id: ...] that appears above for each "
+            "song, with a valid hook_start_sec/hook_end_sec for that song. "
+            "Every song in the list must appear exactly once."
+        )
+        return "\n".join(lines)
     def _build_prompt(self, songs, previous):
         lines = []
         lines.append("You are an expert DJ building one continuous set.")
@@ -474,42 +648,34 @@ class Agent:
         lines.append("")
         lines.append("HOOK SELECTION:")
         lines.append(
-            "Return hook_start_sec/hook_end_sec: the actual most-played/"
-            "most-replayed section (chorus, drop, or strongest part), using "
-            "your knowledge of the song. No fixed target length — use the "
-            "section's real span. Avoid intro/outro unless it's genuinely the iconic part."
+            "Return hook_start_sec/hook_end_sec: the actual most compelling "
+            "section, using your knowledge of the song. Do NOT default to "
+            "any typical length (e.g. ~30s) out of habit — let the window "
+            "length come from the music itself, and vary it song to song."
         )
         lines.append(
-            "Choose boundaries WITH the rest of the sequence in mind, not "
-            "each song in isolation: hook_end_sec of a song should land on "
-            "material whose energy/intensity is close to the hook_start_sec "
-            "of the next song, so the splice point itself is a smooth match, "
-            "not just each song's best moment picked independently. If the "
-            "single 'best' window would create a jarring jump into the next "
-            "song's opening, shift the boundary slightly (earlier/later, "
-            "still inside the real hook/decay region) to smooth that specific "
-            "handoff."
+            "NEVER return null, negative, zero-length, or out-of-range hook "
+            "values, and never omit or empty hook_start_sec/hook_end_sec for "
+            "a song you include. There are exactly two mandatory fields per "
+            "song besides its id: hook_start_sec and hook_end_sec — every "
+            "included song MUST have both, filled with real numbers. If you "
+            "are not sure about a song's structure, still give "
+            "a best-guess in-range window — e.g. the strongest passage you "
+            "expect (a drop/build for club tracks, a crescendo or the middle "
+            "movement for classical/orchestral), not timed to the track length "
+            "by formula."
         )
         lines.append(
-            "End a few seconds into the decay/sustain after the peak, not "
-            "exactly on it, so the transition has material to fade over — "
-            "unless the transition is a hard-cut effect (vinyl_stop/"
-            "tape_stop/scratch)."
+            "Not every song has a pop-style hook/chorus/drop. For music "
+            "without one — classical, orchestral, jazz, ambient, long-form "
+            "instrumental — pick the strongest passage or movement on its "
+            "own terms (a theme, a climax, a solo), and let the window run "
+            "as long as that passage actually needs, even 60-120s+. Don't "
+            "force this kind of music into a short pop-length clip."
         )
-        lines.append("")
-        lines.append("CLIP LENGTH (clip_length_sec):")
         lines.append(
-            "Return clip_length_sec per song: how many seconds that song "
-            "actually plays on the floor. This is the authoritative play "
-            "time — vary it so it is NOT the same for every song. Follow "
-            "the set arc: short/quick cuts ~15-25s for warm-up or cooldown "
-            "rests, steady 25-45s for mid-set momentum, and 45-90s for "
-            "peak/top-momentum songs so the crowd stays on the peak. "
-            "It should roughly match hook_end_sec - hook_start_sec, and "
-            "must stay inside the song's duration (you know each song's "
-            "duration from the candidate list)."
+            "Avoid intro/outro unless it's genuinely the iconic part."
         )
-        lines.append("")
         lines.append("TRANSITIONS:")
         lines.append(
             "Every consecutive pair needs a transition, including CURRENTLY "
@@ -580,22 +746,25 @@ class Agent:
             f"genre {song.get('genre') or '?'}"
         )
     def _resolve_hook(self, song, entry, clip_length):
+        """Returns (start, end, from_fallback). from_fallback is True when the
+        Gemini-provided hook was missing or invalid, so the set summary can tell
+        real hooks apart from the 33s fallback."""
         duration_sec = self._duration_seconds(song)
         try:
             start = float(entry.get("hook_start_sec"))
             end = float(entry.get("hook_end_sec"))
         except (TypeError, ValueError):
-            return self._clip_window(song, clip_length)
+            return (*self._clip_window(song, clip_length), True)
         if start < 0 or end <= start:
-            return self._clip_window(song, clip_length)
+            return (*self._clip_window(song, clip_length), True)
         if duration_sec > 0:
             start = min(start, duration_sec)
             end = min(end, duration_sec)
             if end <= start:
-                return self._clip_window(song, clip_length)
+                return (*self._clip_window(song, clip_length), True)
 
         min_len = 8.0
-        max_len = 90.0  # was `clip_length` (default 33) — too low for peak-arc hooks
+        max_len = 120.0
         span = end - start
         if span < min_len:
             if duration_sec > 0 and start + min_len <= duration_sec:
@@ -608,22 +777,22 @@ class Agent:
             if duration_sec > 0 and end > duration_sec:
                 end = duration_sec
                 start = max(0.0, end - max_len)
-        return (round(start, 1), round(end, 1))
-    def _entry_clip_length(self, entry, fallback):
-        """
-        Extract Gemini's authoritative clip_length_sec for a song.
-        Returns None when Gemini did not provide a usable value so the
-        caller can fall back to the requested clip_length (default 33s).
-        The value is clamped to a sane DJ band so a bad model value can
-        never produce a zero- or multi-minute clip.
-        """
-        try:
-            length = float(entry.get("clip_length_sec"))
-        except (TypeError, ValueError):
-            return None
-        if length < 1.0:
-            return None
-        return max(8.0, min(length, 90.0))
+        return (round(start, 1), round(end, 1), False)
+
+    def _print_fallback(self, song, clip_length):
+        name = (song.get("name") or "Unknown Song").strip()
+        print(
+            f"[hooks] fallback {float(clip_length or 33.0):.1f}s for "
+            f"'{name}' — Gemini gave no usable hook, using the middle section."
+        )
+    # def _entry_clip_length(self, entry):
+    #     try:
+    #         length = float(entry.get("clip_length_sec"))
+    #     except (TypeError, ValueError):
+    #         return None
+    #     if length < 1.0:
+    #         return None
+    #     return max(8.0, min(length, 90.0))
     def _clip_window(self, song, clip_length):
         """
         Safety fallback when Gemini does not provide a valid hook.

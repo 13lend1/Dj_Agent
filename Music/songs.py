@@ -56,6 +56,7 @@ except Exception:
 #     "soul", "disco", "classical", "latin", "edm", "blues", "country",
 #     "metal", "punk", "ambient", "r&b", "indie",'rap'
 # ]
+# 'house','techno','edm','electro-house','deep-house','dub techno','dubstep'
 GENRES=['house','techno','edm','electro-house','deep-house','dub techno','dubstep']
 ARTISTS = {
     # "Drake": "hip-hop", "Kendrick Lamar": "hip-hop", "Kanye West": "hip-hop",
@@ -71,9 +72,9 @@ ARTISTS = {
     # "The Weeknd": "r&b", "Rihanna": "r&b", "Frank Ocean": "r&b",
     # "SZA": "r&b", "Doja Cat": "r&b",
 
-    "Calvin Harris": "edm", "David Guetta": "edm", "Tiësto": "edm",
-    "Avicii": "edm", "Deadmau5": "edm", "Skrillex": "edm", "Marshmello": "edm",
-    "Daft Punk": "edm",
+    # "Calvin Harris": "edm", "David Guetta": "edm", "Tiësto": "edm",
+    # "Avicii": "edm", "Deadmau5": "edm", "Skrillex": "edm", "Marshmello": "edm",
+    # "Daft Punk": "edm",
 
     # "Metallica": "metal", "Nirvana": "rock", "Foo Fighters": "rock",
     # "Red Hot Chili Peppers": "rock", "Radiohead": "rock", "The Beatles": "rock",
@@ -215,7 +216,9 @@ def _random_query_specs(k=3, used_artists=(), used_genres=()):
             return [random.choice(g_pool)] if g_pool else [random.choice(a_pool)]
         return [random.choice(a_pool)] if a_pool else [random.choice(g_pool)]
     n_g = min(len(g_pool), k - k // 2)
-    specs = random.sample(g_pool, k=n_g) + random.sample(a_pool, k=k - n_g)
+    n_a = min(len(a_pool), k - n_g)
+    n_g = min(n_g, k - n_a)
+    specs = random.sample(g_pool, k=n_g) + random.sample(a_pool, k=n_a)
     random.shuffle(specs)
     return specs if specs else [("genre", random.choice(GENRES), random.choice(GENRES))]
 

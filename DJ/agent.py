@@ -12,6 +12,32 @@ GEMINI_REQUEST_TIMEOUT = 45.0
 _GEMINI_LOCK = threading.Lock()
 _GEMINI_LAST_CALL = 0.0
 
+# Build the allowed effect list from actual files on disk (repo/effects/*.mp3).
+# Every curated genre effect in preference.GENRE_EFFECTS that has been
+# downloaded (via effects.py or effects.py --fill) automatically appears here
+# on the next import, so the enum never lists names the playback engine
+# can't actually load.
+def _load_effect_enum():
+    from Music.preference import available_effect_names
+    names = available_effect_names() | {"none"}
+    return sorted(names)
+
+_EFFECT_ENUM = _load_effect_enum()
+
+# Available genre→effects map, filtered to files actually on disk.
+# Used inside _build_prompt to inject per-song effect hints.
+from collections import defaultdict as _defaultdict
+
+def _available_genre_effects():
+    from Music.preference import available_effect_names, GENRE_EFFECTS
+    avail = available_effect_names()
+    return {
+        genre: [e for e in effects if e in avail]
+        for genre, effects in GENRE_EFFECTS.items()
+    }
+
+_AVAILABLE_GENRE_EFFECTS = _available_genre_effects()
+
 
 def _gemini_throttle():
     global _GEMINI_LAST_CALL
@@ -64,35 +90,7 @@ _QUEUE_SCHEMA = {
                     "transition_note": {"type": "string"},
                     "effect": {
                         "type": "string",
-                        "enum": [
-                            "none",
-                            "riser_white_noise",
-                            "riser_synth",
-                            "downlifter",
-                            "impact_boom",
-                            "impact_sub_drop",
-                            "sweep_up",
-                            "sweep_down",
-                            "whoosh",
-                            "filter_sweep_lowpass",
-                            "filter_sweep_highpass",
-                            "vinyl_stop",
-                            "tape_stop",
-                            "reverse_cymbal",
-                            "cymbal_crash",
-                            "snare_roll",
-                            "drum_fill",
-                            "echo_throw",
-                            "air_horn",
-                            "laser_zap",
-                            "siren",
-                            "glitch_stutter",
-                            "scratch",
-                            "white_noise_sweep",
-                            "kick_roll",
-                            "crowd_cheer",
-                            "vocal_tag",
-                        ],
+                        "enum": _EFFECT_ENUM,
                     },
                 },
                 "required": ["id", "hook_start_sec", "hook_end_sec"],
@@ -223,7 +221,7 @@ class Agent:
             if song_id not in seen:
                 ordered.append(song)
         return ordered
-    def build_playlist(self, songs, current=None, clip_length=33):
+    def build_playlist(self, songs, current=None, clip_length=33, place=None):
         """
         Build the complete AI-DJ playlist.
         Gemini decides:
@@ -245,6 +243,10 @@ class Agent:
             Fallback clip length in seconds, used only when Gemini does
             not return a clip_length_sec for a song or returns no valid
             hook (default 33).
+        place:
+            Active place key (e.g. "home"). When given it is stored as the
+            run's single place key in the Agent table; otherwise the place is
+            derived from the songs (stored only when every song shares one).
         Returns
         -------
         list[dict]
@@ -401,21 +403,22 @@ class Agent:
                 f"{clip_length:.1f}s fallback."
             )
         self._finalize_transitions(playlist, previous=previous)
-        self._save_response(playlist)
+        self._save_response(playlist, place=place)
         return playlist
-    def _save_response(self, playlist):
+    def _save_response(self, playlist, place=None):
         """Persist every completed agent response to the Agent table.
 
         Stores the ordered songs, the transitions between them, the hook
-        windows and the raw payload, exactly as returned. Saving must never
-        break playlist generation, so a DB error is logged and swallowed.
+        windows, the raw payload, and the run's single place key, exactly as
+        returned. Saving must never break playlist generation, so a DB error
+        is logged and swallowed.
         """
         try:
             from DJ.responses import save_response
         except ImportError:
             from responses import save_response
         try:
-            run_id = save_response(playlist)
+            run_id = save_response(playlist, place=place)
             if run_id:
                 print(f"[Agent] Saved response {run_id} ({len(playlist)} songs).")
         except Exception as exc:
@@ -441,7 +444,7 @@ class Agent:
             songs=songs, previous=previous
         )
         last_exc = None
-        for attempt in range(3):
+        for attempt in range(5):
             try:
                 chat = self._client.chats.create(
                     model=self._model,
@@ -473,14 +476,14 @@ class Agent:
                     raise exc
                 if "503" in str(exc) or "unavailable" in lower \
                         or "overloaded" in lower or "busy" in lower:
-                    delay = 10.0  # flash is overloaded — needs the pause to recover
+                    delay = 20.0  # model overloaded — needs the pause to recover
                 elif "429" in lower or "too many" in lower or "rate limit" in lower:
                     delay = 20.0 * (attempt + 1)
                 else:
                     delay = 5.0 * (attempt + 1)
-                if attempt < 2:
+                if attempt < 4:
                     print(f"[Gemini] Request failed ({exc}); retrying in {delay:.0f}s "
-                          f"(attempt {attempt + 2}/3)...")
+                          f"(attempt {attempt + 2}/5)...")
                     time.sleep(delay)
         raise last_exc
     def _request_hooks(self, songs):
@@ -501,7 +504,7 @@ class Agent:
         _gemini_throttle()
         prompt = self._build_hook_prompt(songs)
         last_exc = None
-        for attempt in range(2):
+        for attempt in range(4):
             try:
                 chat = self._client.chats.create(
                     model=self._model,
@@ -520,9 +523,9 @@ class Agent:
                     )
                     if attempt == 0:
                         print(
-                            "[Gemini] Hook repair returned empty; retrying in 5s..."
+                            "[Gemini] Hook repair returned empty; retrying in 15s..."
                         )
-                        time.sleep(5.0)
+                        time.sleep(15.0)
                     continue
                 data = json.loads(response.text)
                 hooks = data.get("hooks") or []
@@ -545,11 +548,11 @@ class Agent:
                 return windows
             except Exception as exc:
                 last_exc = exc
-                if attempt == 0:
+                if attempt < 3:
                     print(
-                        f"[Gemini] Hook repair failed ({exc}); retrying in 5s..."
+                        f"[Gemini] Hook repair failed ({exc}); retrying in 15s..."
                     )
-                    time.sleep(5.0)
+                    time.sleep(15.0)
         # The repair is best-effort: never let it kill playlist generation.
         print(f"[Gemini] Hook repair gave up ({last_exc}); using fallbacks.")
         return {}
@@ -698,10 +701,26 @@ class Agent:
         lines.append("")
         lines.append("EFFECTS:")
         lines.append(
-            "Default 'none'. Riser for builds, impact for drops/big energy "
-            "changes, sweep for smooth transitions, vinyl_stop/tape_stop/"
-            "scratch only for intentional dramatic breaks."
+            "Default 'none'. The transition INTO each song may use an effect "
+            "from its genre list below — all are files the playback engine "
+            "can actually load. Choose an effect only when it genuinely "
+            "improves the transition's motion or energy shift; 'none' is "
+            "always a valid choice."
         )
+        lines.append("")
+        # Group songs by genre for the per-genre effect hint.
+        genre_to_songs = {}
+        for i, song in enumerate(songs, start=1):
+            g = song.get("genre")
+            if g:
+                genre_to_songs.setdefault(g, []).append(i)
+        lines.append("GENRE-SPECIFIC EFFECTS:")
+        for genre, indices in sorted(genre_to_songs.items()):
+            effects = _AVAILABLE_GENRE_EFFECTS.get(genre, [])
+            if not effects:
+                continue
+            song_nums = ", ".join(f"#{i}" for i in indices)
+            lines.append(f"  {genre} ({song_nums}): {', '.join(effects)}")
         lines.append("")
         lines.append(
             "Only return IDs from the candidate list, no invented IDs, and "

@@ -28,6 +28,7 @@ from songs import (
     take_preprocessed_batch,
     delete_unscored_songs,
     save_song_metadata,
+    _title_matches_genre,
 )
 
 EFFECTS_DIR = os.path.join(
@@ -48,15 +49,32 @@ class DJ(PreloadedPlayer):
     the hook end, and the rate/skip + save-to-Songs cycle is unchanged.
     """
 
-    def __init__(self, pool_size=50, top_n=15, clip_length=33, resume_unplayed=None):
+    def __init__(self, pool_size=50, top_n=15, clip_length=33, resume_unplayed=None, resume_place=None):
         # Resume set state MUST exist and be loaded before super().__init__()
         # starts the background worker threads: otherwise the batch worker
         # could build a fresh run and overwrite the newest saved run (and its
         # played/unplayed flags) before it has been read.
         # 1 resum 0 no resume
+        if resume_place is None:
+            resume_place = os.environ.get("DJ_RESUME_PLACE", "").strip().lower() or None
+        if resume_place is None:
+            try:
+                from preference import DEFAULT_PLACE
+                resume_place = DEFAULT_PLACE if DEFAULT_PLACE else None
+            except ImportError:
+                pass
+        self.resume_place = resume_place
+        # Active place governs BOTH fresh fetching (only that place's genres
+        # are pulled, tagged and played) and resume-by-place filtering. It must
+        # be set before super().__init__() so the worker threads see it.
+        self.place = resume_place
         if resume_unplayed is None:
-            resume_unplayed = os.environ.get("DJ_RESUME_UNPLAYED", "0").strip().lower() \
-                not in {"0", "false", "no", "off"}
+            if resume_place:
+                # picking a place to resume implies we want to resume
+                resume_unplayed = True
+            else:
+                resume_unplayed = os.environ.get("DJ_RESUME_UNPLAYED", "1").strip().lower() \
+                    not in {"0", "false", "no", "off"}
         self.resume_unplayed = resume_unplayed
         self._saved_set = []
         self._saved_lock = threading.Lock()
@@ -127,7 +145,7 @@ class DJ(PreloadedPlayer):
             return samples
 
     def _fetch_batch(self):
-        candidates = take_preprocessed_batch(n=self.pool_size)
+        candidates = take_preprocessed_batch(n=self.pool_size, place=getattr(self, 'place', None))
         if not candidates:
             return
 
@@ -141,6 +159,15 @@ class DJ(PreloadedPlayer):
             candidates = [c for c in candidates if c.get('id') not in played]
         if not candidates:
             print("Batch contained only already-played songs; skipping.")
+            return
+
+        before = len(candidates)
+        candidates = [c for c in candidates
+                      if not _title_matches_genre(c.get('name') or c.get('title'), c.get('genre'))]
+        if len(candidates) < before:
+            print(f"Filtered {before - len(candidates)} genre-named song(s) from batch.")
+        if not candidates:
+            print("All candidates were genre-named songs; skipping batch.")
             return
 
         try:
@@ -168,7 +195,7 @@ class DJ(PreloadedPlayer):
         if not current:
             current = self.agent.last()
         playlist = self.agent.build_playlist(
-            records, current=current, clip_length=self.clip_length
+            records, current=current, clip_length=self.clip_length, place=getattr(self, 'place', None)
         ) if records else []
 
         # Agent-approved songs are persisted to the Songs table (the linear
@@ -216,11 +243,19 @@ class DJ(PreloadedPlayer):
 
         playable = []
         played = 0
+        skipped_place = 0
+        skipped_title = 0
         for song in songs or []:
             if not isinstance(song, dict):
                 continue
             if song.get("played"):
                 played += 1
+                continue
+            if self.resume_place and song.get("place") != self.resume_place:
+                skipped_place += 1
+                continue
+            if _title_matches_genre(song.get("name") or song.get("title"), song.get("genre")):
+                skipped_title += 1
                 continue
             if song.get("link"):
                 playable.append(dict(song))
@@ -229,8 +264,15 @@ class DJ(PreloadedPlayer):
             self._saved_set = playable
 
         if playable:
+            where = f" for '{self.resume_place}'" if self.resume_place else ""
             print(f"Resuming {len(playable)} unplayed track(s) from the last "
-                  f"Agent run ({played} already played, skipped).")
+                  f"Agent run{where} ({played} already played, skipped)"
+                  + (f", {skipped_place} for other places" if skipped_place else "")
+                  + (f", {skipped_title} genre-named" if skipped_title else "") + ".")
+        elif self.resume_place and skipped_place:
+            print(f"No unplayed '{self.resume_place}' tracks left in the last "
+                  f"Agent run ({played} played, {skipped_place} belong to other "
+                  "places) — waiting for a fresh batch.")
         # Return a copy: get_next_song() mutates the internal _saved_set by
         # popping songs off it as they are served, so callers that need the
         # full resume list (e.g. __main__) must not share that object.
@@ -354,7 +396,7 @@ class DJ(PreloadedPlayer):
             print("No song available to preload, fetching a random one.")
             if self.stop_event.is_set():
                 return
-            song_info = get_random_song()
+            song_info = get_random_song(place=getattr(self, 'place', None))
 
         if song_info is None:
             print("Could not find a song to preload.")
@@ -450,6 +492,17 @@ class DJ(PreloadedPlayer):
             return float(crossfade_sec)
         except (TypeError, ValueError):
             return 0.0
+
+    @staticmethod
+    def _early_end(elapsed, clip):
+        """True when a stream ended well before its clip window should have
+        finished (dead / region-blocked / short wrong video). A legitimate full
+        play of a short song (clip == real length) must NOT be flagged, so the
+        bar is at most ~5s, and half the clip. Returns False when the window is
+        unknown."""
+        if clip is None or clip <= 0:
+            return False
+        return elapsed < max(5.0, 0.5 * clip)
 
     @staticmethod
     def _cap_crossfade(clip, crossfade_sec):
@@ -921,6 +974,20 @@ class DJ(PreloadedPlayer):
 
                     song_for_played = dict(self.current_song) if self.current_song is not None else None
 
+                    # A stream that dies well before its clip window ends isn't a
+                    # "finished song" — it's a dead / region-blocked / short wrong
+                    # video. Don't flag it as played (so it can drift back and be
+                    # refetched) and don't make it the replay target.
+                    clip = self.current_clip_duration
+                    with self.lock:
+                        early_elapsed = time.time() - self.current_start_time
+                    early = self._early_end(early_elapsed, clip)
+                    if early:
+                        print(f"Stream ended early ({early_elapsed:.1f}s of a "
+                              f"{clip}s window) — treating as a failed link, "
+                              "it can be refetched later.", flush=True)
+                    prev_last = self.last_song
+
                     if not self._transition_scored:
                         self._transition_scored = True
                         with self.lock:
@@ -945,8 +1012,10 @@ class DJ(PreloadedPlayer):
                         self._keep_preloaded(get_next_song)
                         time.sleep(2.0)
                         continue
-                    if song_for_played:
+                    if song_for_played and not early:
                         self._mark_played(song_for_played)
+                    if early:
+                        self.last_song = prev_last
 
                     self._dry_started = None
                     self._advance_fail_count = 0
@@ -1063,15 +1132,22 @@ if __name__ == "__main__":
         "--no-resume", dest="resume_unplayed", action="store_false",
         help="skip saved unplayed tracks and always select fresh agent sets",
     )
+    parser.add_argument(
+        "--resume-place", dest="resume_place", default=None,
+        help="resume only unplayed tracks flagged with a PLACE_GENRES key "
+             "(e.g. gym, party, study)",
+    )
     args = parser.parse_args()
-    dj = DJ(pool_size=40, top_n=15, resume_unplayed=args.resume_unplayed)
+    dj = DJ(pool_size=40, top_n=15, resume_unplayed=args.resume_unplayed,
+            resume_place=args.resume_place)
     print("Looking for the first batch of songs to play...")
 
     with dj._saved_lock:
         saved_count = len(dj._saved_set)
     if saved_count:
         first_song = dj.get_next_song()
-        print(f"Found {saved_count} unplayed track(s) from the last Agent run — "
+        where = f" for '{args.resume_place}'" if args.resume_place else ""
+        print(f"Found {saved_count} unplayed track(s) from the last Agent run{where} — "
               "resuming them before asking the Agent for a new set.")
     elif dj.resume_unplayed:
         first_song = None

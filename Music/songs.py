@@ -10,6 +10,7 @@ import json
 import collections
 from concurrent.futures import ThreadPoolExecutor, FIRST_COMPLETED, wait
 from audio_specs import get_features_cached
+from preference import PLACE_GENRES
 import pprint
 
 _yt = None
@@ -51,31 +52,30 @@ try:
 except Exception:
     pass
 
-# GENRES = [
-#     "house", "techno", "jazz", "rock", "hip-hop","hiphop", "pop","alt-pop", "reggae", "funk",
-#     "soul", "disco", "classical", "latin", "edm", "blues", "country",
-#     "metal", "punk", "ambient", "r&b", "indie",'rap'
-# ]
-# 'house','techno','edm','electro-house','deep-house','dub techno','dubstep'
-GENRES= [
-    "ambient",
-    "downtempo",
-    "chillout",
-    "lounge",
-    "dreampop",
-    "jazz",
-    "latin jazz",
-    "bossa-nova",
-    "neo-soul",
-    "motown",
-    "folk",
-    "ork-pop",
-    "funk",
-    "disco",
-    "pop",
-    "easy listening",
-    "classical",
-]
+# GENRES is no longer hard-coded: it is the union of every genre list in
+# preference.py's PLACE_GENRES (place -> [genres]). Each fetched song is tagged
+# with the PLACE_GENRES key it was picked for, so a track knows which place it
+# was chosen to fit and can be flagged per-key in the Agent table.
+GENRES = sorted({genre for genres in PLACE_GENRES.values() for genre in genres})
+
+
+def places_for(genre):
+    """PLACE_GENRES keys whose genre list includes `genre` (dict order)."""
+    if not genre:
+        return []
+    return [place for place, genres in PLACE_GENRES.items() if genre in genres]
+
+
+def place_for_genre(genre, default=None):
+    """The first PLACE_GENRES key containing `genre`, else `default`."""
+    places = places_for(genre)
+    return places[0] if places else default
+
+
+def _random_place_genre():
+    """Pick a random (place key, genre) pair straight from PLACE_GENRES."""
+    place = random.choice(list(PLACE_GENRES))
+    return place, random.choice(PLACE_GENRES[place])
 ARTISTS = {
     # "Drake": "hip-hop", "Kendrick Lamar": "hip-hop", "Kanye West": "hip-hop",
     # "Jay-Z": "hip-hop", "50 Cent": "hip-hop", "Snoop Dogg": "hip-hop",
@@ -136,9 +136,9 @@ def _played_already(song_id):
         return False
 
 
-def get_random_song(max_attempts=5):
+def get_random_song(max_attempts=5, place=None):
     for attempt in range(1, max_attempts + 1):
-        song = _fetch_random_song()
+        song = _fetch_random_song(place=place)
         if song and not _played_already(song.get('id')):
             return song
         print(f"Attempt {attempt}/{max_attempts} returned an already-played song, "
@@ -170,16 +170,15 @@ def _mb_search(query, attempts=3):
 MB_LOCK = threading.Lock()
 _MB_CANDIDATES = collections.deque()
 
-def _refill_queue(used_artists=(), used_genres=()):
+def _refill_queue(used_artists=(), used_genres=(), place=None):
     # Always run an artist query (plus a tag query) so named artists from the
     # ARTISTS dict get real airtime instead of being drowned by tag results.
-    specs = _random_query_specs(2, used_artists=used_artists, used_genres=used_genres)
+    specs = _random_query_specs(2, used_artists=used_artists, used_genres=used_genres, place=place)
     got_any = False
-    for kind, value, genre in specs:
+    for kind, value, genre, place in specs:
         result = _mb_search(_mb_query_string(kind, value))
         if not (result and isinstance(result, dict) and result.get("recording-list")):
             continue
-        got_any = True
 
         recordings = result["recording-list"]
         if kind == "artist":
@@ -192,6 +191,8 @@ def _refill_queue(used_artists=(), used_genres=()):
             title = rec.get('title')
             artist = rec.get('artist-credit-phrase')
             if not title or not artist:
+                continue
+            if _title_matches_genre(title, genre):
                 continue
             length = rec.get('length')
             album = None
@@ -210,26 +211,58 @@ def _refill_queue(used_artists=(), used_genres=()):
                 'year': year,
                 'duration': int(length) if length and length.isdigit() else None,
                 'genre': genre,
+                'place': place,
                 'source': 'artist' if kind == "artist" else 'tag',
             })
+            got_any = True
     if got_any:
         random.shuffle(_MB_CANDIDATES)
         return True
     return False
 
-def _random_query_specs(k=3, used_artists=(), used_genres=()):
-    """Samples k (kind, value, genre) triples so a refill batch mixes tag- and
-    artist-based discovery, preferring genres/artists that aren't already
-    saturated in the current batch. Fresh genres and artists are preferred so
-    the pool doesn't flood with one act or one sound."""
-    g_pool = [("genre", g, g) for g in GENRES if g not in used_genres]
-    a_pool = [("artist", a, g) for a, g in ARTISTS.items() if a not in used_artists]
+def _genre_specs(place, used_genres):
+    """(kind, value, genre, place) tuples for genre/tag queries. With a place,
+    only that place's genres are candidates, so a place-capped run plays (and
+    tags) exclusively its own genres."""
+    if place:
+        return [("genre", g, g, place)
+                for g in PLACE_GENRES.get(place, []) if g not in used_genres]
+    return [("genre", g, g, p)
+            for p, genres in PLACE_GENRES.items()
+            for g in genres if g not in used_genres]
+
+
+def _artist_specs(place, used_artists):
+    """Artist-based specs. With a place, only artists whose genre belongs to
+    that place's genre list are candidates (keeps named artists on-place)."""
+    if place:
+        place_genres = PLACE_GENRES.get(place, [])
+        return [("artist", a, g, place) for a, g in ARTISTS.items()
+                if a not in used_artists and g in place_genres]
+    return [("artist", a, g, place_for_genre(g, random.choice(list(PLACE_GENRES))))
+            for a, g in ARTISTS.items() if a not in used_artists]
+
+
+def _random_query_specs(k=3, used_artists=(), used_genres=(), place=None):
+    """Samples k (kind, value, genre, place) tuples so a refill batch mixes
+    tag- and artist-based discovery while preferring genres/artists that aren't
+    already saturated. Every genre carries the PLACE_GENRES key it came from, so
+    the produced tracks can be flagged with that place. When place is set, only
+    that place's genres (and its artists) are ever sampled."""
+    g_pool = _genre_specs(place, used_genres)
+    a_pool = _artist_specs(place, used_artists)
     if len(g_pool) < k // 2:
-        g_pool = [("genre", g, g) for g in GENRES]
+        g_pool = _genre_specs(place, set())
     if len(a_pool) < k - k // 2:
-        a_pool = [("artist", a, g) for a, g in ARTISTS.items()]
+        a_pool = _artist_specs(place, set())
     if k == 1:
-        # single query: flip a coin between a random genre and a random artist
+        # single query: flip a coin between a random place-genre and a random artist
+        if not g_pool and not a_pool:
+            if place and PLACE_GENRES.get(place):
+                genre = random.choice(PLACE_GENRES[place])
+                return [("genre", genre, genre, place)]
+            place, genre = _random_place_genre()
+            return [("genre", genre, genre, place)]
         if random.random() < 0.5:
             return [random.choice(g_pool)] if g_pool else [random.choice(a_pool)]
         return [random.choice(a_pool)] if a_pool else [random.choice(g_pool)]
@@ -238,7 +271,13 @@ def _random_query_specs(k=3, used_artists=(), used_genres=()):
     n_g = min(n_g, k - n_a)
     specs = random.sample(g_pool, k=n_g) + random.sample(a_pool, k=n_a)
     random.shuffle(specs)
-    return specs if specs else [("genre", random.choice(GENRES), random.choice(GENRES))]
+    if specs:
+        return specs
+    if place and PLACE_GENRES.get(place):
+        genre = random.choice(PLACE_GENRES[place])
+        return [("genre", genre, genre, place)]
+    place, genre = _random_place_genre()
+    return [("genre", genre, genre, place)]
 
 
 def _mb_query_string(kind, value):
@@ -246,7 +285,22 @@ def _mb_query_string(kind, value):
         return f'artist:"{value}"'
     return f"tag:{value}"
 
-def _next_candidate(used_artists=(), used_genres=()):
+def _title_matches_genre(title, genre):
+    """True when the song title contains any base word of its genre as a word,
+    e.g. 'Rock Rock' (genre 'rock' or 'indie rock') and 'Pop Pop' ('indie pop').
+    Each genre is split into base words on spaces AND hyphens, so 'indie pop'
+    rejects 'Pop Pop', and 'hip-hop' rejects 'Hip Hop Anthems'. Whole-word
+    matching keeps 'pop' from rejecting genuine tracks like 'Popular'."""
+    if not title or not genre:
+        return False
+    words = [w for w in re.split(r'[\s-]+', genre) if w]
+    if not words:
+        return False
+    pattern = r'\b(?:' + '|'.join(re.escape(w) for w in words) + r')\b'
+    return bool(re.search(pattern, title, re.IGNORECASE))
+
+
+def _next_candidate(used_artists=(), used_genres=(), place=None):
     with MB_LOCK:
         while True:
             if _MB_CANDIDATES:
@@ -259,15 +313,21 @@ def _next_candidate(used_artists=(), used_genres=()):
                     continue
                 if cand.get('source') != 'artist' and cand['genre'] in used_genres:
                     continue
+                if place and cand.get('place') and cand['place'] != place:
+                    continue
+                if _title_matches_genre(cand.get('title') or cand.get('name'), cand.get('genre')):
+                    continue
                 return cand
 
-            if _refill_queue(used_artists=used_artists, used_genres=used_genres):
+            if _refill_queue(used_artists=used_artists, used_genres=used_genres, place=place):
                 continue  # loop pops the freshly queued candidate
 
-            kind, value, genre = random.choice(_random_query_specs(
-                k=1, used_artists=used_artists, used_genres=used_genres))
-            song = _yt_fallback(value, genre)
+            kind, value, genre, place = random.choice(_random_query_specs(
+                k=1, used_artists=used_artists, used_genres=used_genres, place=place))
+            song = _yt_fallback(value, genre, place=place)
             if song is not None:
+                if _title_matches_genre(song.get('name'), song.get('genre')):
+                    return None
                 song['source'] = 'artist' if kind == "artist" else 'tag'
             return song
     
@@ -390,8 +450,11 @@ def _ytdl_search_link(title, artist, max_results=5):
         _info_holder = {}
 
         def _run_search():
-            _info_holder['info'] = ydl.extract_info(
-                f"ytsearch{max_results}:{title} {artist}", download=False)
+            try:
+                _info_holder['info'] = ydl.extract_info(
+                    f"ytsearch{max_results}:{title} {artist}", download=False)
+            except BaseException as exc:
+                _info_holder['exc'] = exc
 
         _search_thread = threading.Thread(target=_run_search, daemon=True)
         _search_thread.start()
@@ -400,6 +463,8 @@ def _ytdl_search_link(title, artist, max_results=5):
             _reset_ytdl()
             _log_ytscrape_error("yt-dlp search error", TimeoutError("extract timed out"))
             return None
+        if 'exc' in _info_holder:
+            raise _info_holder['exc']
         info = _info_holder.get('info')
     except Exception as e:
         _log_ytscrape_error("yt-dlp search error", e)
@@ -411,7 +476,7 @@ def _ytdl_search_link(title, artist, max_results=5):
             return f"https://www.youtube.com/watch?v={ent['id']}"
     return None
 
-def _yt_fallback(term, genre):
+def _yt_fallback(term, genre, place=None):
     try:
         results = _get_yt().search(term, filter="songs", limit=20)
     except Exception as e:
@@ -433,21 +498,27 @@ def _yt_fallback(term, genre):
         'album': album,
         'artist': artist,
         'genre': genre,
+        'place': place or place_for_genre(genre),
         'duration': _parse_duration(video.get('duration')),
         'year': None,
         'id': video['videoId'],
     }
     
-def _fetch_random_song():
-    kind, value, genre = random.choice(_random_query_specs(k=1))
+def _fetch_random_song(place=None):
+    kind, value, genre, place = random.choice(_random_query_specs(k=1, place=place))
     result = _mb_search(_mb_query_string(kind, value))
 
     recording = None
     if result and isinstance(result, dict) and result.get("recording-list"):
-        try:
-            recording = random.choice(result["recording-list"])
-        except (IndexError, KeyError):
-            recording = None
+        recordings = list(result["recording-list"])
+        random.shuffle(recordings)
+        # Skip recordings whose title contains the genre name (e.g. a track
+        # literally titled 'House' for the house query).
+        for rec in recordings:
+            if _title_matches_genre(rec.get('title'), genre):
+                continue
+            recording = rec
+            break
 
     if recording:
         song_id = recording.get('id')
@@ -474,16 +545,21 @@ def _fetch_random_song():
             return None
 
         return {'link': link, 'name': title, 'album': album, 'artist': artist,
-                'genre': genre, 'duration': length_ms, 'year': year, 'id': song_id}
+                'genre': genre, 'place': place, 'duration': length_ms, 'year': year, 'id': song_id}
 
-    song = _yt_fallback(value, genre)
+    song = _yt_fallback(value, genre, place=place)
     if song is None:
         print("Could not find a playable song (MusicBrainz + YTMusic both failed).")
+    elif _title_matches_genre(song.get('name'), song.get('genre')):
+        return None
     return song
 
 def _build_song(cand, max_attempts=3):
     """Turns a candidate into a playable, feature-complete song dict (or None).
-    YTMusic link lookup + cached ReccoBeats features, retried a few times."""
+    YTMusic link lookup + cached ReccoBeats features, retried a few times.
+    Genre-named tracks ('Rock Rock' for genre rock) are rejected up front."""
+    if _title_matches_genre(cand.get('title') or cand.get('name'), cand.get('genre')):
+        return None
     for _ in range(max_attempts):
         try:
             if cand.get('link'):
@@ -498,6 +574,7 @@ def _build_song(cand, max_attempts=3):
                     'album': cand['album'],
                     'artist': cand['artist'],
                     'genre': cand['genre'],
+                    'place': cand.get('place'),
                     'duration': cand['duration'],
                     'year': cand['year'],
                     'id': cand['id'],
@@ -513,10 +590,11 @@ def _build_song(cand, max_attempts=3):
     return None
 
 
-def get_random_songs(n=20, max_attempts=5, batch_size=5, on_song=None, workers=3):
+def get_random_songs(n=20, max_attempts=5, batch_size=5, on_song=None, workers=3, place=None):
     """Fetches n songs with parallel link discovery + feature extraction.
     MusicBrainz queries stay serialized (their rate limit), while YTMusic and
-    ReccoBeats calls run across `workers` threads. Features are disk-cached."""
+    ReccoBeats calls run across `workers` threads. Features are disk-cached.
+    With a place, every fetched song comes from that place's genres."""
     songs = []
     seen = set()
     got = 0
@@ -535,9 +613,9 @@ def get_random_songs(n=20, max_attempts=5, batch_size=5, on_song=None, workers=3
         return (set(a for a, c in artist_count.items() if c >= artist_max),
                 set(g for g, c in genre_count.items() if c >= genre_max))
 
-    def _job(_genre):
+    def _job(_place):
         used_artists, used_genres = _used_sets()
-        cand = _next_candidate(used_artists=used_artists, used_genres=used_genres)
+        cand = _next_candidate(used_artists=used_artists, used_genres=used_genres, place=_place)
         if cand is None:
             return None
         return _build_song(cand, max_attempts=max_attempts)
@@ -550,11 +628,12 @@ def get_random_songs(n=20, max_attempts=5, batch_size=5, on_song=None, workers=3
                       "played — widen the catalog or clear the genre tables.")
                 break
             while len(futures) < workers and got < n:
-                futures.add(ex.submit(_job, random.choice(GENRES)))
+                futures.add(ex.submit(_job, place))
             done, futures = wait(futures, timeout=1.0, return_when=FIRST_COMPLETED)
             for f in done:
                 song = f.result()
                 if song is None:
+                    skips += 1  # link/feature failure or a rejected genre-named track
                     continue
                 if _played_already(song.get('id')):
                     skips += 1
@@ -579,14 +658,15 @@ def get_random_songs(n=20, max_attempts=5, batch_size=5, on_song=None, workers=3
     return songs
 
 
-def fill_preprocessed(target=300, workers=3):
+def fill_preprocessed(target=300, workers=3, place=None):
     """Pre-fills the Preprocessed pool up to `target` songs.
 
     Run it before starting the DJ so the pool is already stocked, e.g.:
         python fill_preprocessed.py 300
-    Existing rows are kept and duplicates are skipped.
+    Existing rows are kept and duplicates are skipped. With a place, only that
+    place's genres are fetched (and a place-filtered count is used).
     """
-    have = preprocessed_count()
+    have = preprocessed_count(place=place)
     if have >= target:
         print(f"Preprocessed already has {have} songs (target {target}) — nothing to do.")
         return 0
@@ -606,7 +686,7 @@ def fill_preprocessed(target=300, workers=3):
 
     print(f"Filling Preprocessed: {have} -> {target} (need {need} more)...")
     t0 = time.time()
-    get_random_songs(n=need, workers=workers, on_song=on_song)
+    get_random_songs(n=need, workers=workers, on_song=on_song, place=place)
     elapsed = time.time() - t0
     print(f"Done in {elapsed:.0f}s. Preprocessed: {have + added}/{target} (+{added} new).")
     checkpoint()
@@ -730,18 +810,27 @@ def delete_unscored_songs():
     return _db_exec(_run)
 
 
+def _ensure_preprocessed_place(conn):
+    """Add the place column to Preprocessed (once), so the per-track
+    PLACE_GENRES key survives the pool and reaches the Agent table."""
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(Preprocessed)").fetchall()}
+    if "place" not in cols:
+        conn.execute("ALTER TABLE Preprocessed ADD COLUMN place TEXT")
+
+
 def save_preprocessed(song):
     def _run(conn):
+        _ensure_preprocessed_place(conn)
         cur = conn.execute(
             """
             INSERT OR IGNORE INTO Preprocessed
-                (id, name, artist, album, genre, year, link, duration,
+                (id, name, artist, album, genre, place, year, link, duration,
                 bpm, energy, danceability, valence, acousticness, instrumentalness)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 song['id'], song['name'], song['artist'], song['album'],
-                song['genre'], song['year'], song['link'], song['duration'],
+                song['genre'], song.get('place'), song['year'], song['link'], song['duration'],
                 song['bpm'], song['energy'], song['danceability'],
                 song['valence'], song['acousticness'], song['instrumentalness']
             ))
@@ -752,10 +841,9 @@ def save_preprocessed(song):
 def peek_preprocessed(limit=100):
     """Pulls a candidate pool without removing anything — scoring decides what plays."""
     def _run(conn):
+        _ensure_preprocessed_place(conn)
         rows = conn.execute(
-            """SELECT id, name, artist, album, genre, year, link, duration,
-                      bpm, energy, danceability, valence, acousticness, instrumentalness
-               FROM Preprocessed ORDER BY id ASC LIMIT ?""",
+            "SELECT * FROM Preprocessed ORDER BY id ASC LIMIT ?",
             (limit,)
         ).fetchall()
         cols = [d[0] for d in conn.execute("SELECT * FROM Preprocessed LIMIT 0").description]
@@ -764,13 +852,18 @@ def peek_preprocessed(limit=100):
     return _db_exec(_run)
 
 
-def take_preprocessed_batch(percent=0.2, min_batch=1, n=None):
+def take_preprocessed_batch(percent=0.2, min_batch=1, n=None, place=None):
     """Atomically pulls rows out of Preprocessed and removes them. If n is given,
-    takes up to n rows; otherwise takes percent% (min min_batch)."""
+    takes up to n rows; otherwise takes percent% (min min_batch). With a place,
+    only rows of that place are taken (other places stay in the pool undriven)
+    so a place-capped run never plays another place's tracks."""
     def _run(conn):
         conn.execute("BEGIN IMMEDIATE")
         try:
-            total = conn.execute("SELECT COUNT(*) FROM Preprocessed").fetchone()[0]
+            _ensure_preprocessed_place(conn)
+            where = " WHERE place = ?" if place else ""
+            params = (place,) if place else ()
+            total = conn.execute("SELECT COUNT(*) FROM Preprocessed" + where, params).fetchone()[0]
             if total == 0:
                 conn.execute("COMMIT")
                 return []
@@ -780,10 +873,8 @@ def take_preprocessed_batch(percent=0.2, min_batch=1, n=None):
             else:
                 take = max(min_batch, int(total * percent))
             rows = conn.execute(
-                """SELECT id, name, artist, album, genre, year, link, duration,
-                          bpm, energy, danceability, valence, acousticness, instrumentalness
-                   FROM Preprocessed ORDER BY id ASC LIMIT ?""",
-                (take,)
+                "SELECT * FROM Preprocessed" + where + " ORDER BY id ASC LIMIT ?",
+                params + (take,)
             ).fetchall()
             cols = [d[0] for d in conn.execute("SELECT * FROM Preprocessed LIMIT 0").description]
             songs = [dict(zip(cols, r)) for r in rows]
@@ -812,8 +903,11 @@ def remove_from_preprocessed(ids):
     _db_exec(_run)
 
 
-def preprocessed_count():
+def preprocessed_count(place=None):
     def _run(conn):
+        if place:
+            return conn.execute("SELECT COUNT(*) FROM Preprocessed WHERE place = ?",
+                                (place,)).fetchone()[0]
         return conn.execute("SELECT COUNT(*) FROM Preprocessed").fetchone()[0]
     return _db_exec(_run)
 

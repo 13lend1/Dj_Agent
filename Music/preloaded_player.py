@@ -55,12 +55,13 @@ class PreloadedPlayer(Player):
         max_chunk = 50  # one fetch round is still snappy; the loop chains them
         while not self.stop_event.is_set():
             try:
-                count = preprocessed_count()
+                count = preprocessed_count(place=getattr(self, 'place', None))
                 need = high_water - count
                 if need >= 5:
                     get_random_songs(
                         n=min(need, max_chunk),
                         on_song=save_preprocessed,
+                        place=getattr(self, 'place', None),
                     )
             except Exception as e:
                 print("Refill error:")
@@ -86,7 +87,7 @@ class PreloadedPlayer(Player):
                 min_needed = max(self.top_n, 3)
 
                 while not self.stop_event.is_set():
-                    count = preprocessed_count()
+                    count = preprocessed_count(place=getattr(self, 'place', None))
                     now = time.time()
                     if count == 0 and now - last_print >= 15:
                         print("Waiting for the first candidates... (pool is empty)")
@@ -111,7 +112,7 @@ class PreloadedPlayer(Player):
                 time.sleep(check_interval)
 
     def _fetch_batch(self):
-        candidates = take_preprocessed_batch(n=self.pool_size)
+        candidates = take_preprocessed_batch(n=self.pool_size, place=getattr(self, 'place', None))
         if not candidates:
             return
 

@@ -166,6 +166,7 @@ class Agent:
     """
     def __init__(self, api_key=None, model=GEMINI_MODEL):
         self._last = None
+        self._last_effect_name = None
         api_key = api_key or os.environ.get("GEMINI_API_KEY")
         if not api_key:
             raise RuntimeError(
@@ -1052,20 +1053,34 @@ class Agent:
         seconds = bars * self._bar_seconds(avg_bpm)
         seconds = max(0.15, min(seconds, 16.0))  # was max(1.0, ...) — was erasing all quick transitions
         return round(seconds, 1)
-    @staticmethod
-    def _pick_fallback_effect(transition_type, bpm_diff, energy_diff):
+    _EFFECT_FALLBACKS = ["sweep_up", "filter_sweep_lowpass",
+                         "impact_sub_drop", "tape_stop",
+                         "downlifter", "whoosh", "synth_sweep"]
+
+    def _pick_fallback_effect(self, transition_type, bpm_diff, energy_diff):
         """
-        Pick an effect only when Gemini didn't provide one.
+        Pick an effect only when Gemini didn't provide one. Consecutive
+        transitions rotate away from the effect just used, so the same sound
+        never repeats back-to-back and the set doesn't sound like one effect
+        firing over and over.
         """
         if transition_type == "beatmatched_crossfade":
             if bpm_diff <= 2:
-                return "sweep_up"
-            return "filter_sweep_lowpass"
-        if energy_diff > 0.4:
-            return "impact_sub_drop"
-        if bpm_diff > 24:
-            return "tape_stop"
-        return "none"
+                effect = "sweep_up"
+            else:
+                effect = "filter_sweep_lowpass"
+        elif energy_diff > 0.4:
+            effect = "impact_sub_drop"
+        elif bpm_diff > 24:
+            effect = "tape_stop"
+        else:
+            return "none"
+        if effect == self._last_effect_name and len(self._EFFECT_FALLBACKS) > 1:
+            effect = self._EFFECT_FALLBACKS[
+                (self._EFFECT_FALLBACKS.index(effect) + 1) % len(self._EFFECT_FALLBACKS)
+            ]
+        self._last_effect_name = effect
+        return effect
     @staticmethod
     def _normalize_effect(name):
         """

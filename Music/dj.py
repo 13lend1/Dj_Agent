@@ -6,6 +6,8 @@ import time
 import threading
 import subprocess
 import argparse
+import hashlib
+import tempfile
 import numpy as np
 import queue as _q
 import yt_dlp
@@ -28,14 +30,13 @@ from songs import (
     take_preprocessed_batch,
     delete_unscored_songs,
     save_song_metadata,
+    recycle_played_songs,
     _title_matches_genre,
 )
 
 EFFECTS_DIR = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "effects"
 )
-
-
 
 class DJ(PreloadedPlayer):
     """
@@ -90,11 +91,35 @@ class DJ(PreloadedPlayer):
         self._preload_lock = threading.Lock()
         self._preloading = False
         self._play_gain = 1.0  # per-song loudness-matched gain, applied to the live stream
+        self._mark_queue = queue.Queue()
+        threading.Thread(target=self._mark_worker, daemon=True).start()
+        self._last_transition_pair = None
+        self._last_transition_at = 0.0
+        self._stall_started = None
+        # Local audio cache: yt-dlp downloads each track to disk (keyed by its
+        # page URL) and ffmpeg decodes the file, so music requests never leave
+        # ffmpeg -> no googlevideo 403 and no mid-stream session kills.
+        self._media_files = {}
+        self._media_lock = threading.Lock()
+        self._media_dir = None
+        self._hold_wait_since = None
+        self._holding = False
+        self._hold_inflight = False  # at most one async ring-fence prep in flight
+        # A process must have exactly one stdout pump: two readers divide its
+        # PCM bytes between their buffers.
+        self._readers = {}
+        self._readers_lock = threading.Lock()
 
     _CHUNK = 4096 * 2 * 2  # 4096 stereo int16 frames
     MIN_CROSSFADE = 2.0     # anything shorter sounds like a hard cut
-    POOL_DRY_TIMEOUT = 120.0  # how long to keep the current song playing while the
-                             # preload/batch pipeline catches up before giving up
+    POOL_DRY_TIMEOUT = 120.0  # how long to keep the current song rolling while the
+                             # preload/batch pipeline catches up. A dry pool NEVER
+                             # shuts the DJ down — it just keeps retrying forever.
+    HOLD_TIMEOUT = 5.0        # silent grace before the deck ring-fences the last
+                             # known-good song so audio never goes fully dead while
+                             # the pipeline refills (guarantees nonstop behavior)
+    STALL_TIMEOUT = 2.0    # how long a connected-but-silent stream may sit before it
+                             # is treated as dead and skipped (prevents long-session freeze)
     DEFAULT_TRANSITION = {"type": "crossfade", "crossfade_sec": 2.0, "note": "Default crossfade."}
     _effect_cache = {}
     _effect_lock = threading.Lock()
@@ -145,30 +170,54 @@ class DJ(PreloadedPlayer):
             return samples
 
     def _fetch_batch(self):
-        candidates = take_preprocessed_batch(n=self.pool_size, place=getattr(self, 'place', None))
+        fresh = take_preprocessed_batch(n=self.pool_size, place=getattr(self, 'place', None))
+
+        candidates = []
+        if fresh:
+            try:
+                from duplicates import played_ids
+                played = played_ids(c.get('id') for c in fresh)
+            except Exception as e:
+                print("Played-check failed, treating batch as new:", e)
+                played = set()
+            if played:
+                fresh = [c for c in fresh if c.get('id') not in played]
+                print(f"Filtered {len(played)} already-played song(s) from the "
+                      f"fresh batch (kept {len(fresh)}).")
+            candidates = fresh
+
+        # Nonstop guarantee: once the pool of unplayed songs is exhausted,
+        # recycle already-played songs so the DJ keeps playing forever instead
+        # of running dry (the catalog is finite, the set must not be).
+        if len(candidates) < self.top_n:
+            try:
+                recycled = recycle_played_songs(
+                    n=self.pool_size, place=getattr(self, 'place', None))
+            except Exception as e:
+                print("Recycle lookup failed:", e)
+                recycled = []
+            seen = {c.get('id') for c in candidates}
+            recycled = [r for r in recycled if r.get('id') not in seen]
+            if recycled:
+                print(f"Recycling {len(recycled)} already-played song(s) to keep "
+                      "the set running (pool of new songs is low).")
+                candidates += recycled
+
         if not candidates:
             return
 
-        try:
-            from duplicates import played_ids
-            played = played_ids(c.get('id') for c in candidates)
-        except Exception as e:
-            print("Played-check failed, treating batch as new:", e)
-            played = set()
-        if played:
-            candidates = [c for c in candidates if c.get('id') not in played]
-        if not candidates:
-            print("Batch contained only already-played songs; skipping.")
-            return
-
+        unfiltered = candidates
         before = len(candidates)
         candidates = [c for c in candidates
                       if not _title_matches_genre(c.get('name') or c.get('title'), c.get('genre'))]
         if len(candidates) < before:
             print(f"Filtered {before - len(candidates)} genre-named song(s) from batch.")
         if not candidates:
-            print("All candidates were genre-named songs; skipping batch.")
-            return
+            # Something is better than silence — never skip a batch entirely
+            # and leave the deck with nothing to play.
+            print("All candidates were genre-named songs; using the raw batch "
+                  "to avoid going silent.")
+            candidates = unfiltered
 
         try:
             delete_unscored_songs()
@@ -289,6 +338,22 @@ class DJ(PreloadedPlayer):
                     return song
         return super().get_next_song(timeout)
 
+    def _mark_worker(self):
+        """Background worker that settles an outgoing song: records the genre
+        (so it won't be refetched) and flags it as played in the Agent run.
+        Both are database writes that grew slower as the Agent table filled up,
+        so they must never run inside the audio-loop thread — a slow mark would
+        freeze the stream and make skip/seek unresponsive."""
+        while True:
+            song = self._mark_queue.get()
+            if song is None:
+                break
+            try:
+                self._record_genre(song)
+                self._mark_played(song)
+            except Exception as e:
+                print("Mark-played error:", e)
+
     def _mark_played(self, song):
         """Flag a track as played (start-to-end) in the newest Agent run so the
         next DJ start resumes from where the set actually left off."""
@@ -298,13 +363,124 @@ class DJ(PreloadedPlayer):
         except Exception as e:
             print("Could not flag song as played:", e)
 
-    # ---- audio: seek to the hook start -----------------------------------
+    def stop(self):
+        super().stop()
+        # Give the background worker a moment to settle queued marks so the
+        # resume state is accurate; the audio loop is already shutting down.
+        deadline = time.time() + 10.0
+        while not self._mark_queue.empty() and time.time() < deadline:
+            time.sleep(0.1)
+
+        # Tidy the downloaded scratch files; anything still held open by a
+        # dying ffmpeg is skipped.
+        with self._media_lock:
+            paths = list(self._media_files.values())
+            self._media_files.clear()
+        for path in paths:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+
+    # ---- audio: download locally, then seek to the hook start ------------
+
+    _MEDIA_MAX_FILES = 80   # bound the on-disk cache for long sessions
+
+    def _media_cache_dir(self):
+        """Local scratch dir holding yt-dlp's downloaded audio. ffmpeg decodes
+        from here instead of requesting the media URL itself: googlevideo signs
+        those URLs against yt-dlp's impersonated TLS/cookie session, so ffmpeg's
+        own request is routinely rejected with HTTP 403 (and killed mid-stream).
+        """
+        d = self._media_dir
+        if d and os.path.isdir(d):
+            return d
+        d = os.path.join(tempfile.gettempdir(), 'dj_agent_audio')
+        os.makedirs(d, exist_ok=True)
+        self._media_dir = d
+        return d
+
+    def _evict_media(self):
+        """Bound the cache: drop the oldest downloads first. A file still open
+        by a live ffmpeg cannot be unlinked on Windows, so in-use tracks are
+        protected by construction; any failure is skipped."""
+        with self._media_lock:
+            if len(self._media_files) <= self._MEDIA_MAX_FILES:
+                return
+            entries = sorted(
+                self._media_files.items(),
+                key=lambda kv: os.path.getmtime(kv[1]) if os.path.isfile(kv[1]) else 0,
+            )
+            for dur, path in entries:
+                if len(self._media_files) <= self._MEDIA_MAX_FILES:
+                    break
+                try:
+                    os.remove(path)
+                except OSError:
+                    continue
+                self._media_files.pop(dur, None)
+
+    @staticmethod
+    def _run_ytdlp(options, url):
+        """yt-dlp call with a browser-cookie fallback: a missing/locked browser
+        profile must never take playback down, so retry once without it."""
+        try:
+            with yt_dlp.YoutubeDL(options) as ydl:
+                ydl.download([url])
+        except Exception as exc:
+            if ('cookies database' in str(exc).lower()
+                    and options.get('cookiesfrombrowser')):
+                fallback = dict(options)
+                fallback.pop('cookiesfrombrowser', None)
+                print('Browser cookies unavailable; retrying without them.',
+                      flush=True)
+                with yt_dlp.YoutubeDL(fallback) as ydl:
+                    ydl.download([url])
+                return
+            raise
+
+    def _download_media(self, url, options):
+        """Download the best audio track to a local file using yt-dlp's own
+        (impersonated, cookie-bearing) HTTP stack, caching it by page URL so
+        seeks, restarts and replays never refetch. Returns the local path."""
+        with self._media_lock:
+            cached = self._media_files.get(url)
+            if cached and os.path.isfile(cached):
+                return cached
+
+        out_dir = self._media_cache_dir()
+        key = hashlib.sha1(url.encode('utf-8')).hexdigest()[:16]
+        dl_opts = dict(options)
+        dl_opts.update({
+            'outtmpl': os.path.join(out_dir, key + '.%(ext)s'),
+            'noprogress': True,
+            'overwrites': True,
+        })
+        if self.stop_event.is_set():
+            raise RuntimeError(f"Stopped while downloading {url}")
+        self._run_ytdlp(dl_opts, url)
+        if self.stop_event.is_set():
+            raise RuntimeError(f"Stopped while downloading {url}")
+
+        matches = [os.path.join(out_dir, f) for f in os.listdir(out_dir)
+                   if f.startswith(key + '.') and not f.endswith('.part')]
+        if not matches:
+            raise RuntimeError(f"Download produced no file for {url}")
+        path = max(matches, key=os.path.getmtime)
+        with self._media_lock:
+            self._media_files[url] = path
+        self._evict_media()
+        return path
 
     def prepare_song(self, song, seek_to=None):
         """Seek-aware prepare: accepts a song dict (seeks to play_start_sec, or
         to `seek_to` seconds into the full track when given) or a plain URL.
-        If the fast 'seek-before-input' fails, ffmpeg is retried without the
-        seek so playback never starts with dead air."""
+
+        yt-dlp fetches the track to a local file first and ffmpeg decodes that
+        file, so no music request ever leaves ffmpeg. Direct streaming made
+        ffmpeg request a URL signed to yt-dlp's session, which googlevideo
+        answered with HTTP 403 / mid-stream kills. A local file is always
+        seekable, so `-ss` before `-i` is enough."""
         if isinstance(song, dict):
             url = song['link']
             seek = seek_to if seek_to is not None else song.get('play_start_sec')
@@ -315,6 +491,7 @@ class DJ(PreloadedPlayer):
         options = {
             'format': 'bestaudio/best',
             'quiet': True,
+            'noprogress': True,
             'noplaylist': True,
             'socket_timeout': 30,
             'retries': 3,
@@ -322,69 +499,58 @@ class DJ(PreloadedPlayer):
             'force_ipv4': True,
             'js_runtimes': _DENO,
             'remote_components': ['ejs:github'],
-            'http_headers': {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
-                              'AppleWebKit/537.36 (KHTML, like Gecko) '
-                              'Chrome/126.0 Safari/537.36',
-                'Accept': '*/*',
-            },
+            'http_headers': {'Accept': '*/*'},
         }
+        # Prefer an explicitly exported Netscape cookies.txt file. It avoids
+        # Windows browser-profile locks and is more reliable for long sessions.
+        cookie_file = os.environ.get('DJ_YTDLP_COOKIES_FILE', '').strip()
+        if cookie_file:
+            if os.path.isfile(cookie_file):
+                options['cookiefile'] = cookie_file
+            else:
+                print(f'Cookie file not found: {cookie_file}; continuing without it.',
+                      flush=True)
+        else:
+            # Use the user's normal browser session when it is accessible.
+            # Set DJ_YTDLP_COOKIES_BROWSER= to disable it, or use firefox/edge.
+            cookie_browser = os.environ.get('DJ_YTDLP_COOKIES_BROWSER', 'chrome').strip()
+            if cookie_browser:
+                options['cookiesfrombrowser'] = (cookie_browser,)
 
+        media_path = self._download_media(url, options)
+
+        # A local-file decode either starts at once or fails immediately, so a
+        # failed seek is retried once without it instead of starting on silence.
         last_exc = None
         for use_seek in ([seek, None] if seek else [None]):
             if self.stop_event.is_set():
                 raise RuntimeError(f"Stopped while preparing {url}")
-            try:
-                _info_holder = {}
-
-                def _run_extract():
-                    try:
-                        with yt_dlp.YoutubeDL(options) as ydl:
-                            _info_holder['info'] = ydl.extract_info(url, download=False)
-                    except BaseException as exc:
-                        _info_holder['exc'] = exc
-
-                _extract_thread = threading.Thread(target=_run_extract, daemon=True)
-                _extract_thread.start()
-                _extract_thread.join(timeout=60)
-                if _extract_thread.is_alive():
-                    raise TimeoutError(f"yt-dlp extract timed out for {url}")
-                if 'exc' in _info_holder:
-                    raise _info_holder['exc']
-                stream_url = _info_holder['info'].get('url')
-                if not stream_url:
-                    raise RuntimeError(f"No stream URL found for {url}")
-
-                process = subprocess.Popen(
-                    ['ffmpeg'] +
-                    (['-ss', str(use_seek)] if use_seek else []) +
-                    ['-i', stream_url,
-                     '-f', 's16le',
-                     '-acodec', 'pcm_s16le',
-                     '-ar', '44100',
-                     '-ac', '2',
-                     '-'],
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.DEVNULL,
-                    bufsize=0
-                )
-
-                if use_seek:
-                    # give ffmpeg a moment: if input seeking is unsupported the
-                    # process exits almost immediately -> retry without the seek
-                    time.sleep(0.5)
-                    if process.poll() is not None:
-                        raise RuntimeError("ffmpeg exited during seek-based input")
-
+            cmd = ['ffmpeg']
+            if use_seek:
+                cmd += ['-ss', str(use_seek)]
+            cmd += [
+                '-i', media_path,
+                '-f', 's16le',
+                '-acodec', 'pcm_s16le',
+                '-ar', '44100',
+                '-ac', '2',
+                '-',
+            ]
+            process = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=(open(os.environ["DJ_FFMPEG_ERR"], "ab", buffering=0)
+                        if os.environ.get("DJ_FFMPEG_ERR") else subprocess.DEVNULL),
+                bufsize=0,
+            )
+            time.sleep(0.2)
+            if process.poll() is None:
                 return process
-            except (KeyboardInterrupt, SystemExit):
-                raise
-            except Exception as e:
-                last_exc = e
-                if not use_seek:
-                    raise
-                # extraction likely failed, not the seek: retry without seek
-                print("prepare_song retrying without seek:", e)
+            last_exc = RuntimeError(
+                f"ffmpeg exited early (code {process.poll()}) for {url}"
+            )
+            if use_seek:
+                print("prepare_song retrying without seek:", last_exc, flush=True)
 
         raise last_exc
 
@@ -417,6 +583,8 @@ class DJ(PreloadedPlayer):
             except Exception:
                 pass
             return
+        
+        self._reader_queue(process) 
 
         with self._preload_procs_lock:
             self._preload_processes.add(process)
@@ -485,6 +653,7 @@ class DJ(PreloadedPlayer):
             )
         self._play_gain = 1.0
         self._transition_scored = False
+        self._stall_started = None
         self.agent.track(song)
     @staticmethod
     def _transition_secs(crossfade_sec):
@@ -524,12 +693,12 @@ class DJ(PreloadedPlayer):
 
     def _score_current_song(self):
         """Likeability stays the model's prediction for the song, unless the
-        audience input a 0-9 rating — then rating/9 wins."""
+        audience input a 0-9 rating — then rating/9 wins. Only scores; the
+        genre record + Agent-run mark are settled by the background
+        _mark_worker so this never blocks the audio loop."""
         with self.lock:
             song = dict(self.current_song)
             score = self.current_rating
-
-        self._record_genre(song)
 
         if score is not None:
             likeability = round(score / 9, 2)
@@ -557,6 +726,14 @@ class DJ(PreloadedPlayer):
         since stream.write blocks on real playback), so the ramp stays correct
         regardless of how fast the pipes drain.
 
+        The two decoders deliver chunks of different sizes at different moments.
+        Both are drained into carry buffers and mixed only over the frames BOTH
+        have delivered at that instant, so neither stream is ever zero-padded
+        mid-stream: padding where real music will arrive next made amplitude
+        steps at chunk boundaries, heard as a buzzing/clattering artefact during
+        the overlap. A side is only crossed with true silence when it actually
+        has no audio right now (ended or buffering).
+
         `effect` is an optional (N, 2) int32 PCM buffer (44100 Hz stereo) mixed
         on top of the blend for as long as it lasts, with its own fast fade-in
         and tail fade-out so it sits cleanly over the transition.
@@ -578,9 +755,11 @@ class DJ(PreloadedPlayer):
         # is nothing to blend out of, so bring the incoming in quickly instead
         # of sitting at low volume through a long fade. Read via the reader
         # queue (the same path the play loop uses): a direct stdout.read here
-        # would fight the pump thread for the same pipe.
+        # would fight the pump thread for the same pipe. The short timeout
+        # keeps a stalled outgoing from pinning the transition (see deadline
+        # below): a transitional stall must never read like a long freeze.
         try:
-            probe = self._read_chunk(out_process, timeout=15.0)
+            probe = self._read_chunk(out_process, timeout=1.0)
             if probe is None:          # stalling, not ended: fade treats it as silent
                 probe = b""
         except (OSError, ValueError):
@@ -596,49 +775,80 @@ class DJ(PreloadedPlayer):
         ref_level = 0.20 * 32768.0            # ~-14 dBFS anchor when outgoing is dead
         ema = 0.25
         min_gain, max_gain = 0.5, 2.0         # +/-6 dB per transition, no crazy swings
-        first_iter = True
 
+        # Frame-accurate carry buffers (see docstring: no mid-stream padding).
+        a_carry = probe
+        b_carry = b""
+
+        # Hard wall-clock bound: healthy crossfades finish in ~secs (stream.write
+        # blocks on real playback), so a multi-x stretch means one side is
+        # stalling. Without this cap a dead-but-alive stream lets each pass eat
+        # its 1s read timeout while advancing only ~0.09s of fade — a transition
+        # could sit for MINUTES and read as a hard freeze. Bail and let the
+        # main-loop stall watchdog handle a truly dead incoming stream.
+        crossfade_deadline = time.time() + max(secs * 3.0, 30.0)
+        a_real_eof = b_real_eof = False
         while not self.stop_event.is_set():
-            t = 1.0 if fade_bytes <= 0 else min(written / fade_bytes, 1.0)
-
-            if first_iter:
-                a = probe
-                first_iter = False
-            else:
-                try:
-                   a = self._read_chunk(out_process, timeout=15.0)
-                   if a is None:
-                       a = b""
-                except (OSError, ValueError):
-                    a = b""
-            try:
-               b = self._read_chunk(in_process, timeout=15.0)
-               if b is None:
-                   b = b""
-            except (OSError, ValueError):
-                b = b""
-
-            if not a and not b:
+            if time.time() > crossfade_deadline:
                 break
-            a = a[:len(a) // 4 * 4]
-            b = b[:len(b) // 4 * 4]
-            nframes = max(len(a), len(b)) // 4
-            n_samples = nframes * 2
-            ba = np.zeros(n_samples, dtype=np.int32)
-            bb = np.zeros(n_samples, dtype=np.int32)
-            if a:
-                ba[:len(a) // 2] = np.frombuffer(a, dtype=np.int16).astype(np.int32)
-            if b:
-                bb[:len(b) // 2] = np.frombuffer(b, dtype=np.int16).astype(np.int32)
+            t1 = 1.0 if fade_bytes <= 0 else min(written / fade_bytes, 1.0)
 
-            if len(a):
+            try:
+                a_chunk = self._read_chunk(out_process, timeout=1.0)
+            except (OSError, ValueError):
+                a_chunk = b""
+            if a_chunk is None:
+                a_chunk = b""          # stalled, not ended
+            elif a_chunk == b"":
+                a_real_eof = True      # confirmed real end
+            a_carry += a_chunk[:len(a_chunk) // 4 * 4]
+
+            try:
+                b_chunk = self._read_chunk(in_process, timeout=1.0)
+            except (OSError, ValueError):
+                b_chunk = b""
+            if b_chunk is None:
+                b_chunk = b""
+            elif b_chunk == b"":
+                b_real_eof = True
+            b_carry += b_chunk[:len(b_chunk) // 4 * 4]
+
+            a_frames = len(a_carry) // 4
+            b_frames = len(b_carry) // 4
+            if a_frames == 0 and b_frames == 0:
+                if a_real_eof and b_real_eof:
+                    break               # both genuinely ended — nothing more to mix
+                continue 
+
+            # If only one deck has audio right now (the other ended or is
+            # buffering), cross it with true silence so the device never
+            # underruns — a real absence of audio, not the cadence mismatch
+            # that caused the buzzing.
+            if a_frames == 0:
+                nframes = b_frames
+                a_real = np.zeros(nframes * 2, dtype=np.int16)
+                b_real = np.frombuffer(b_carry[:nframes * 4], dtype=np.int16)
+            elif b_frames == 0:
+                nframes = a_frames
+                a_real = np.frombuffer(a_carry[:nframes * 4], dtype=np.int16)
+                b_real = np.zeros(nframes * 2, dtype=np.int16)
+            else:
+                nframes = min(a_frames, b_frames)
+                a_real = np.frombuffer(a_carry[:nframes * 4], dtype=np.int16)
+                b_real = np.frombuffer(b_carry[:nframes * 4], dtype=np.int16)
+
+            a_carry = a_carry[nframes * 4:]
+            b_carry = b_carry[nframes * 4:]
+
+            # Loudness matching on the real (unpadded) frames only.
+            if a_real.size:
                 rms_a = float(np.sqrt(
-                    np.mean(ba[:len(a) // 2].astype(np.float64) ** 2)
+                    np.mean(a_real.astype(np.float64) ** 2)
                 )) + 1e-8
                 out_level = rms_a if out_level is None else ema * rms_a + (1 - ema) * out_level
-            if len(b):
+            if b_real.size:
                 rms_b = float(np.sqrt(
-                    np.mean(bb[:len(b) // 2].astype(np.float64) ** 2)
+                    np.mean(b_real.astype(np.float64) ** 2)
                 )) + 1e-8
                 in_level = rms_b if in_level is None else ema * rms_b + (1 - ema) * in_level
             if in_level is not None:
@@ -646,15 +856,19 @@ class DJ(PreloadedPlayer):
                 target = min(max(reference / in_level, min_gain), max_gain)
                 gain_in = gain_in + 0.3 * (target - gain_in)
 
+            # Continuous ramp across this window: each frame gets its own gain,
+            # so window-size changes never step the volume.
+            frame_t = np.linspace(t1, min((written + nframes * 4) / fade_bytes, 1.0), nframes)
             if dead_out:
-                bt = min(1.0, t / fast_frac)
-                out_gain = 0.0
+                bt = np.minimum(1.0, frame_t / fast_frac)
+                out_gain = np.zeros(nframes, dtype=np.float64)
                 in_gain = np.sin(bt * half_pi)
             else:
-                out_gain = np.cos(t * half_pi)
-                in_gain = np.sin(t * half_pi)
+                out_gain = np.cos(frame_t * half_pi)
+                in_gain = np.sin(frame_t * half_pi)
 
-            mix = ba * out_gain + bb * (in_gain * gain_in)
+            mix = (a_real.astype(np.float64) * out_gain.repeat(2)
+                   + b_real.astype(np.float64) * (in_gain.repeat(2) * gain_in))
             if eff is not None:
                 eff_chunk = eff[eff_i:eff_i + nframes]
                 have = len(eff_chunk)
@@ -673,9 +887,9 @@ class DJ(PreloadedPlayer):
             mix = self._soft_limit(mix)
             chunk = mix.tobytes()
             stream.write(chunk)
-            written += len(chunk)
+            written += nframes * 4
 
-            if t >= 1.0:
+            if written >= fade_bytes:
                 break
 
         return float(np.clip(gain_in, min_gain, max_gain))
@@ -702,6 +916,16 @@ class DJ(PreloadedPlayer):
         matched_gain = 1.0
         consumed = 0.0
         if crossfade_sec and crossfade_sec > 0:
+            # Never re-fire the same transition's effect if the same song pair
+            # gets blended more than once (stalled pipeline retries). The sound
+            # must play exactly once per transition, never looped/restacked.
+            now = time.time()
+            pair = ((outgoing or {}).get('id'), next_song.get('id'))
+            if pair == self._last_transition_pair and now - self._last_transition_at < 30.0:
+                effect = None
+            else:
+                self._last_transition_pair = pair
+                self._last_transition_at = now
             effect_samples = self._load_effect(effect)
             matched_gain = self._crossfade(current, next_process, stream, crossfade_sec, effect=effect_samples)
             consumed = crossfade_sec
@@ -739,6 +963,7 @@ class DJ(PreloadedPlayer):
 
             current = self.prepare_song(first_song)
             self._begin_song(first_song, current)
+            self._holding = False
             print(f"Now playing: {self.current_title} {self._fmt_hook(first_song)}",
                   flush=True)
             self._keep_preloaded(get_next_song)
@@ -768,6 +993,7 @@ class DJ(PreloadedPlayer):
                     current = self.prepare_song(song)
 
                     self._begin_song(song, current)
+                    self._holding = False
 
                     print(f"\nRestarting from the beginning: {self.current_title} {self._fmt_hook(song)}",
                           flush=True)
@@ -794,6 +1020,7 @@ class DJ(PreloadedPlayer):
 
                     current = self.prepare_song(replay_song)
                     self._begin_song(replay_song, current)
+                    self._holding = False
                     self.last_song = outgoing
 
                     print(f"\nNow playing (replayed): {self.current_title} {self._fmt_hook(replay_song)}",
@@ -883,26 +1110,42 @@ class DJ(PreloadedPlayer):
                     with self.lock:
                         self.current_elapsed = time.time() - self.current_start_time
 
-                    self._score_current_song()
+                    if not self._transition_scored:
+                        self._transition_scored = True
+                        self._score_current_song()
 
                     if not self.replay_event.is_set():
                         if transitions.get('type') != 'cut':
                             print(f"Crossfading out: {transitions.get('note', '')}")
 
-                    next_song = self._advance(current, stream, crossfade_sec, effect=effect, wait=True)
+                    next_song = self._safe_advance(current, stream, crossfade_sec, effect=effect)
 
                     if next_song is None:
-                        print("No preloaded song available.")
-                        self.stop()
-                        break
-
-                    current = next_song['process']
-                    self._advance_fail_count = 0
-                    self._dry_started = None
-                    self._transition_scored = False
-                    print(f"Starting next song: {self.current_title} {self._fmt_hook(next_song)}")
-                    self._keep_preloaded(get_next_song)
-                    continue
+                        # No preloaded song yet (slow preload / batch still
+                        # warming up). Never shut the DJ down for that — keep
+                        # the current song rolling and let the normal advance
+                        # path grab the song the moment it lands.
+                        if self._dry_started is None:
+                            self._dry_started = time.time()
+                            print("Skipping — waiting for the next song to "
+                                  "preload...", flush=True)
+                        elif time.time() - self._dry_started >= self.POOL_DRY_TIMEOUT:
+                            # A dry pool must NEVER stop the DJ: keep the current
+                            # song rolling and keep retrying the pipeline.
+                            print("Pool is dry — keeping the current song rolling "
+                                  "while the pipeline refills.", flush=True)
+                            self._dry_started = time.time()
+                        self._keep_preloaded(get_next_song)
+                    else:
+                        current = next_song['process']
+                        self._advance_fail_count = 0
+                        self._dry_started = None
+                        self._hold_wait_since = None
+                        self._holding = False
+                        self._transition_scored = False
+                        print(f"Starting next song: {self.current_title} {self._fmt_hook(next_song)}")
+                        self._keep_preloaded(get_next_song)
+                        continue
 
                 # As the hook window runs out, begin the suggested crossfade
                 elapsed = time.time() - self.current_start_time
@@ -916,17 +1159,18 @@ class DJ(PreloadedPlayer):
                     # the same song would be scored / marked-played repeatedly.
                     if not self._transition_scored:
                         self._transition_scored = True
-                        with self.lock:
-                            self.current_elapsed = elapsed
-                        song_for_played = dict(self.current_song) if self.current_song is not None else None
-                        self._score_current_song()
-                        if not self.replay_event.is_set():
-                            if transitions.get('type') != 'cut':
-                                print(f"\nCrossfading to next: {transitions.get('note', '')}")
-                        if song_for_played:
-                            self._mark_played(song_for_played)
+                        if not self._holding:
+                            with self.lock:
+                                self.current_elapsed = elapsed
+                            song_for_played = dict(self.current_song) if self.current_song is not None else None
+                            self._score_current_song()
+                            if not self.replay_event.is_set():
+                                if transitions.get('type') != 'cut':
+                                    print(f"\nCrossfading to next: {transitions.get('note', '')}")
+                            if song_for_played:
+                                self._mark_queue.put(dict(song_for_played))
 
-                    next_song = self._advance(current, stream, crossfade_sec, effect=effect)
+                    next_song = self._safe_advance(current, stream, crossfade_sec, effect=effect)
 
                     if next_song is None:
                         # Preload is still warming up / the pool is refilling.
@@ -938,21 +1182,23 @@ class DJ(PreloadedPlayer):
                             self._dry_started = time.time()
                             print("Crossfade ready — waiting for the next song to "
                                   "preload...", flush=True)
-                        if time.time() - self._dry_started >= self.POOL_DRY_TIMEOUT:
-                            print("No more songs available — the pool is dry.", flush=True)
-                            self.stop()
-                            break
+                        elif time.time() - self._dry_started >= self.POOL_DRY_TIMEOUT:
+                            print("Pool is dry — keeping the current song rolling "
+                                  "while the pipeline refills.", flush=True)
+                            self._dry_started = time.time()
                         self._keep_preloaded(get_next_song)
                     else:
                         self._dry_started = None
                         self._advance_fail_count = 0
+                        self._hold_wait_since = None
+                        self._holding = False
                         current = next_song['process']
                         print(f"\nNow playing: {self.current_title} {self._fmt_hook(next_song)}")
                         self._keep_preloaded(get_next_song)
                         continue
 
                 try:
-                    data = self._read_chunk(current, timeout=15.0)
+                    data = self._read_chunk(current, timeout=1.0)
                 except (OSError, ValueError):
                     data = b""
 
@@ -963,9 +1209,23 @@ class DJ(PreloadedPlayer):
                     # made slow streams get skipped a few seconds in.
                     if self.stop_event.is_set():
                         break
+                    if self._stall_started is None:
+                        self._stall_started = time.time()
+                    elif time.time() - self._stall_started > self.STALL_TIMEOUT:
+                        # A stream that stays connected yet silent forever is
+                        # dead, not slow. Without this watchdog the deck waits
+                        # on it indefinitely (the long-session freeze). Skip it.
+                        print(f"Stream stalled for {self.STALL_TIMEOUT:.0f}s — "
+                              "skipping to the next song.", flush=True)
+                        self._stall_started = None
+                        self._transition_scored = True  # stalled song: score only
+                        self.skip_event.set()
+                        continue
                     self._keep_preloaded(get_next_song)
-                    time.sleep(0.25)
+                    time.sleep(0.05)
                     continue
+
+                self._stall_started = None
 
                 if not data:
 
@@ -982,42 +1242,58 @@ class DJ(PreloadedPlayer):
                     with self.lock:
                         early_elapsed = time.time() - self.current_start_time
                     early = self._early_end(early_elapsed, clip)
-                    if early:
-                        print(f"Stream ended early ({early_elapsed:.1f}s of a "
-                              f"{clip}s window) — treating as a failed link, "
-                              "it can be refetched later.", flush=True)
                     prev_last = self.last_song
 
                     if not self._transition_scored:
                         self._transition_scored = True
-                        with self.lock:
-                            self.current_elapsed = time.time() - self.current_start_time
-                        self._score_current_song()
+                        # A ring-fenced hold song just keeps the deck warm:
+                        # scoring/marking it would re-write DB rows every loop.
+                        if not self._holding:
+                            with self.lock:
+                                self.current_elapsed = time.time() - self.current_start_time
+                            self._score_current_song()
 
                     fade = crossfade_sec if (crossfade_sec and crossfade_sec > 0) else self.DEFAULT_TRANSITION['crossfade_sec']
-                    next_song = self._advance(current, stream, fade, effect=effect)
+                    next_song = self._safe_advance(current, stream, fade, effect=effect)
 
                     if next_song is None:
                         # The song has truly ended but nothing is preloaded yet.
-                        # Keep waiting for the pipeline for a grace period instead
-                        # of dying the instant the queue happens to be empty.
+                        # NEVER stop the DJ over an empty pipeline: keep waiting,
+                        # and once the last good song has been silent long enough,
+                        # ring-fence it so audio never goes fully dead.
                         if self._dry_started is None:
                             self._dry_started = time.time()
                             print("Song ended — waiting for the next song to "
                                   "preload...", flush=True)
                         if time.time() - self._dry_started >= self.POOL_DRY_TIMEOUT:
-                            print("No more songs available — the pool is dry.", flush=True)
-                            self.stop()
-                            break
+                            print("Pool is dry — keeping the last good song "
+                                  "ring-fenced while the pipeline retries.",
+                                  flush=True)
+                            self._dry_started = time.time()
+                        if self._hold_wait_since is None:
+                            self._hold_wait_since = time.time()
+                        elif time.time() - self._hold_wait_since >= self.HOLD_TIMEOUT:
+                            if self._request_hold(song_for_played):
+                                # Ring-fence prepared off the audio loop: the
+                                # moment it lands in the preload queue the next
+                                # _advance plays it. Never blocks playback.
+                                print("Ring-fencing the last good song to keep "
+                                      "audio alive while the pipeline refills.",
+                                      flush=True)
+                            # Don't hammer the network: one request per HOLD_TIMEOUT.
+                            self._hold_wait_since = time.time()
                         self._keep_preloaded(get_next_song)
                         time.sleep(2.0)
                         continue
-                    if song_for_played and not early:
-                        self._mark_played(song_for_played)
+
+                    if song_for_played and not early and not self._holding:
+                        self._mark_queue.put(dict(song_for_played))
                     if early:
                         self.last_song = prev_last
 
                     self._dry_started = None
+                    self._hold_wait_since = None
+                    self._holding = False
                     self._advance_fail_count = 0
                     current = next_song['process']
                     print(f"\nNow playing: {self.current_title} {self._fmt_hook(next_song)}")
@@ -1025,10 +1301,17 @@ class DJ(PreloadedPlayer):
                     continue
 
                 if data:
-                    if self._play_gain != 1.0:
-                        raw = np.frombuffer(data, dtype=np.int16).astype(np.float64)
-                        data = self._soft_limit(raw * self._play_gain).tobytes()
-                    stream.write(data)
+                    try:
+                        if self._play_gain != 1.0:
+                            raw = np.frombuffer(data, dtype=np.int16).astype(np.float64)
+                            data = self._soft_limit(raw * self._play_gain).tobytes()
+                        stream.write(data)
+                    except Exception as wexc:
+                        # A failing device must never take the DJ down: log and
+                        # keep the loop alive so playback resumes the moment the
+                        # output heals.
+                        print("Write hiccup — recovering:", wexc, flush=True)
+                        time.sleep(0.1)
                 self._keep_preloaded(get_next_song)
 
         finally:
@@ -1046,9 +1329,64 @@ class DJ(PreloadedPlayer):
                 pass
 
 
-    def _reader_queue(self, process, maxsize=8):
+    def _request_hold(self, song_for_played=None):
+        """Ring-fence (async): when the pipeline is dry and the current stream
+        has ended, re-prepare the last known-good song in the BACKGROUND and
+        hand it to the preload queue so the deck keeps producing AUDIO instead
+        of going silent forever.
+
+        Everything network-bound (yt-dlp extract, ffmpeg spawn) runs off the
+        audio loop — the main loop just keeps retrying _advance and picks the
+        hold song up the moment it is ready. A real (fresh) song that lands in
+        the queue takes over the same way. Returns True when a prep launched.
+
+        One hold prep is allowed in flight at a time; the caller paces requests
+        so a dead link can't stack a wall of stuck background threads."""
+        if self.stop_event.is_set():
+            return False
+        if self._hold_inflight:
+            return False
+        anchor = song_for_played
+        if not isinstance(anchor, dict) or not anchor.get('link'):
+            anchor = getattr(self, 'last_song', None)
+        if not isinstance(anchor, dict) or not anchor.get('link'):
+            anchor = getattr(self, 'current_song', None)
+        if not isinstance(anchor, dict) or not anchor.get('link'):
+            return False
+        self._hold_inflight = True
+
+        def _run():
+            try:
+                self.preload(dict(anchor))
+            except Exception as e:
+                print("Hold-song prepare failed:", e)
+            finally:
+                self._hold_inflight = False
+
+        threading.Thread(target=_run, daemon=True).start()
+        return True
+
+    def _safe_advance(self, current, stream, crossfade_sec, effect=None, wait=False):
+        """Advance to the next preloaded song, but NEVER let an internal
+        exception (crossfade math, PortAudio write, process kill) kill the
+        player thread and silently stop the DJ. Returns None on failure so
+        the caller retries in the next loop pass — the deck stays alive."""
+        try:
+            return self._advance(current, stream, crossfade_sec,
+                                 effect=effect, wait=wait)
+        except Exception as exc:
+            print("Advance hiccup — recovering:", exc, flush=True)
+            return None
+
+    def _reader_queue(self, process, maxsize=512):
         """Lazily spawn a background thread that keeps pulling process.stdout
         into a queue, so callers never block directly on a stalled pipe.
+
+        The queue is deliberately deep (~48s of audio at 4096 frames/chunk):
+        ffmpeg can burst a whole track far faster than realtime, so a shallow
+        queue made the deck run on a 0.7s cushion — any network dip starved it
+        and surfaced as endless "buffering". A deep queue lets ffmpeg read far
+        ahead and ride out slow spells.
 
         The queue is keyed by the process OBJECT — never ``id(process)``:
         id() values get recycled as soon as a dead Popen is garbage-collected
@@ -1057,37 +1395,53 @@ class DJ(PreloadedPlayer):
         reading the PREVIOUS song's dead queue and "hears" an EOF (or the
         wrong audio) mid-song — which surfaces as _read_chunk firing after a
         few song cycles. Keying by the object ties each queue to its pipe for
-        life, and the pump prunes its own entry as soon as the stream ends."""
-        if not hasattr(self, '_readers'):
-            self._readers = {}
-        q = self._readers.get(process)
-        if q is not None:
-            return q
-        q = _q.Queue(maxsize=maxsize)
+        life; a finished queue is marked ``_done`` (not deleted) so callers
+        keep seeing its real EOF instead of spawning a fresh pump each call."""
+        # Preload and playback can request a reader concurrently. Make the
+        # lookup and publication atomic so they cannot spawn two pumps on the
+        # same pipe (which splits chunks and causes dropouts/premature EOF).
+        with self._readers_lock:
+            q = self._readers.get(process)
+            if q is not None:
+                return q
+            if len(self._readers) > 64:
+                for _p, _queue in list(self._readers.items()):
+                    if getattr(_queue, '_done', False):
+                        del self._readers[_p]
+            q = _q.Queue(maxsize=maxsize)
+            q._done = False
+            self._readers[process] = q
         def _pump():
-            # Backpressure matters here: ffmpeg can decode faster than realtime,
-            # so the pump MUST block on a full queue (which in turn fills
-            # ffmpeg's stdout pipe and paces it to the consumer). Dropping
-            # chunks on a full queue silently skips audio and makes songs end
-            # seconds after they start. We only bail out when the queue stays
-            # full for a full second — meaning the consumer has abandoned this
-            # stream — so no stuck daemon thread / pipe is leaked per song.
+            total = 0
+            reason = "?"
             try:
                 while True:
                     chunk = process.stdout.read(self._CHUNK)
                     if not chunk:
+                        reason = "eof"
                         break
-                    q.put(chunk, timeout=1.0)  # backpressure (blocks, paces ffmpeg)
+                    total += len(chunk)
+                    while True:
+                        try:
+                            q.put(chunk, timeout=0.5)
+                            break
+                        except _q.Full:
+                            if process.poll() is not None or self.stop_event.is_set():
+                                reason = f"abandon poll={process.poll()} stop={self.stop_event.is_set()}"
+                                raise _q.Full
             except _q.Full:
-                pass  # abandoned: nobody drained us for >1s, stop pumping
-            except Exception:
                 pass
+            except Exception as _e:
+                reason = f"exc {_e!r}"
             finally:
+                if os.environ.get("DJ_PUMP_DEBUG"):
+                    print(f"[pump pid={process.pid}] exit reason={reason} "
+                          f"read={total/(44100*4):.1f}s", flush=True)
                 try:
                     q.put(b"", timeout=1.0)  # EOF marker; wait for a slot like data
                 except _q.Full:
                     pass  # genuinely abandoned: nobody will read the marker either
-                self._readers.pop(process, None)
+                q._done = True
         self._readers[process] = q
         threading.Thread(target=_pump, daemon=True).start()
         return q
@@ -1103,6 +1457,9 @@ class DJ(PreloadedPlayer):
         try:
             return q.get(timeout=timeout)
         except _q.Empty:
+            if getattr(q, '_done', False):
+                # The queue is finished and drained: a real end-of-stream.
+                return b""
             if self._readers.get(process) is q:
                 # The pump thread is still alive on this pipe: the song hasn't
                 # ended, its stream is just not delivering bytes right now.
@@ -1110,9 +1467,7 @@ class DJ(PreloadedPlayer):
                     q._stall_shown = True
                     print("Buffering — waiting for stream data...", flush=True)
                 return None
-            # The pump already exited: it queued a b"" EOF marker (real end)
-            # before its own cleanup, or gave up on an abandoned stream.
-            # Either way this stream is done.
+            # Replaced / unknown queue: treat as done.
             return b""
 
     @staticmethod

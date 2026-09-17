@@ -47,26 +47,39 @@ class PreloadedPlayer(Player):
         the next immediately as long as the pool is below target. Candidates are
         also inserted progressively inside each chunk, so the batch worker and
         playback always find pool ready.
-        """
+
+        Once discovery runs dry (refill keeps coming back short), it backs off
+        and lets the batch path recycle already-played songs so the deck keeps
+        playing instead of hammering the APIs against an exhausted catalog."""
         if low_water is None:
             low_water = self.pool_size
         top_n = getattr(self, 'top_n', None) or low_water
         high_water = getattr(self, 'prefill_high_water', None) or max(2 * low_water, low_water + top_n)
         max_chunk = 50  # one fetch round is still snappy; the loop chains them
+        dry_rounds = 0
         while not self.stop_event.is_set():
             try:
                 count = preprocessed_count(place=getattr(self, 'place', None))
                 need = high_water - count
                 if need >= 5:
-                    get_random_songs(
+                    fetched = get_random_songs(
                         n=min(need, max_chunk),
                         on_song=save_preprocessed,
                         place=getattr(self, 'place', None),
                     )
+                    if not fetched or len(fetched) < min(need, max_chunk) // 2:
+                        dry_rounds += 1
+                    else:
+                        dry_rounds = 0
+                else:
+                    dry_rounds = 0
             except Exception as e:
                 print("Refill error:")
                 traceback.print_exc()
-            time.sleep(check_interval)
+                dry_rounds += 1
+            # Back off hard once the catalog looks fully harvested: recycling
+            # already covers playback, so there is no need to keep scraping.
+            time.sleep(check_interval if dry_rounds < 3 else 60)
 
     def _batch_worker(self, check_interval=2):
         while not self.stop_event.is_set():
@@ -95,6 +108,11 @@ class PreloadedPlayer(Player):
                     if count >= min_needed:
                         break
                     if now - wait_start > 45 and count >= 3:
+                        break
+                    if count == 0 and now - wait_start > 10:
+                        # An empty pool means discovery has run dry: stop waiting
+                        # and let _fetch_batch recycle already-played songs so the
+                        # deck never stalls waiting on a fresh catalog.
                         break
                     if now - wait_start > max_wait:
                         print("Pool stayed too small — building a smaller batch "

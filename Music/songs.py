@@ -9,9 +9,18 @@ import time
 import json
 import collections
 from concurrent.futures import ThreadPoolExecutor, FIRST_COMPLETED, wait
-from audio_specs import get_features_cached
-from preference import PLACE_GENRES
+from Music.audio_specs import get_features_cached
+from Music.preference import PLACE_GENRES
 import pprint
+
+# Make DJ_YTDLP_COOKIES_FILE (and the other keys) available even when this
+# module is run directly (e.g. `python Music/songs.py --prefill`), not only
+# through dj.py's import chain.
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except Exception:
+    pass
 
 _yt = None
 
@@ -77,40 +86,40 @@ def _random_place_genre():
     place = random.choice(list(PLACE_GENRES))
     return place, random.choice(PLACE_GENRES[place])
 ARTISTS = {
-    # "Drake": "hip-hop", "Kendrick Lamar": "hip-hop", "Kanye West": "hip-hop",
-    # "Jay-Z": "hip-hop", "50 Cent": "hip-hop", "Snoop Dogg": "hip-hop",
-    # "Dr. Dre": "hip-hop", "Eminem": "hip-hop", "Post Malone": "hip-hop",
-    # "Travis Scott": "hip-hop", "Mac Miller": "hip-hop", "Kid Cudi": "hip-hop",
-    # "Cardi B": "hip-hop", "Megan Thee Stallion": "hip-hop",
+    "Drake": "hip-hop", "Kendrick Lamar": "hip-hop", "Kanye West": "hip-hop",
+    "Jay-Z": "hip-hop", "50 Cent": "hip-hop", "Snoop Dogg": "hip-hop",
+    "Dr. Dre": "hip-hop", "Eminem": "hip-hop", "Post Malone": "hip-hop",
+    "Travis Scott": "hip-hop", "Mac Miller": "hip-hop", "Kid Cudi": "hip-hop",
+    "Cardi B": "hip-hop", "Megan Thee Stallion": "hip-hop",
 
-    # "Taylor Swift": "pop", "Ariana Grande": "pop", "Dua Lipa": "pop",
-    # "Ed Sheeran": "pop", "Billie Eilish": "pop", "Justin Bieber": "pop",
-    # "Adele": "pop", "Sam Smith": "pop", "Lady Gaga": "pop", "Bruno Mars": "pop",
+    "Taylor Swift": "pop", "Ariana Grande": "pop", "Dua Lipa": "pop",
+    "Ed Sheeran": "pop", "Billie Eilish": "pop", "Justin Bieber": "pop",
+    "Adele": "pop", "Sam Smith": "pop", "Lady Gaga": "pop", "Bruno Mars": "pop",
 
-    # "The Weeknd": "r&b", "Rihanna": "r&b", "Frank Ocean": "r&b",
-    # "SZA": "r&b", "Doja Cat": "r&b",
+    "The Weeknd": "r&b", "Rihanna": "r&b", "Frank Ocean": "r&b",
+    "SZA": "r&b", "Doja Cat": "r&b",
 
-    # "Calvin Harris": "edm", "David Guetta": "edm", "Tiësto": "edm",
-    # "Avicii": "edm", "Deadmau5": "edm", "Skrillex": "edm", "Marshmello": "edm",
-    # "Daft Punk": "edm",
+    "Calvin Harris": "edm", "David Guetta": "edm", "Tiësto": "edm",
+    "Avicii": "edm", "Deadmau5": "edm", "Skrillex": "edm", "Marshmello": "edm",
+    "Daft Punk": "edm",
 
-    # "Metallica": "metal", "Nirvana": "rock", "Foo Fighters": "rock",
-    # "Red Hot Chili Peppers": "rock", "Radiohead": "rock", "The Beatles": "rock",
-    # "Queen": "rock", "Led Zeppelin": "rock", "Pink Floyd": "rock", "AC/DC": "rock",
-    # "Arctic Monkeys": "indie", "The Strokes": "indie", "Tame Impala": "indie",
+    "Metallica": "metal", "Nirvana": "rock", "Foo Fighters": "rock",
+    "Red Hot Chili Peppers": "rock", "Radiohead": "rock", "The Beatles": "rock",
+    "Queen": "rock", "Led Zeppelin": "rock", "Pink Floyd": "rock", "AC/DC": "rock",
+    "Arctic Monkeys": "indie", "The Strokes": "indie", "Tame Impala": "indie",
 
-    # "Miles Davis": "jazz", "John Coltrane": "jazz", "Louis Armstrong": "jazz",
-    # "Ella Fitzgerald": "jazz", "Nina Simone": "jazz",
+    "Miles Davis": "jazz", "John Coltrane": "jazz", "Louis Armstrong": "jazz",
+    "Ella Fitzgerald": "jazz", "Nina Simone": "jazz",
 
-    # "Bob Marley": "reggae", "Fela Kuti": "funk", "Toots and the Maytals": "reggae",
-    # "Stevie Wonder": "soul", "Marvin Gaye": "soul", "Aretha Franklin": "soul",
-    # "James Brown": "funk", "Earth, Wind & Fire": "funk",
+    "Bob Marley": "reggae", "Fela Kuti": "funk", "Toots and the Maytals": "reggae",
+    "Stevie Wonder": "soul", "Marvin Gaye": "soul", "Aretha Franklin": "soul",
+    "James Brown": "funk", "Earth, Wind & Fire": "funk",
 
-    # "Daddy Yankee": "latin", "Shakira": "latin", "J Balvin": "latin",
-    # "Karol G": "latin", "Rosalía": "latin",
+    "Daddy Yankee": "latin", "Shakira": "latin", "J Balvin": "latin",
+    "Karol G": "latin", "Rosalía": "latin",
 
-    # "Frédéric Chopin": "classical", "Ludwig van Beethoven": "classical",
-    # "Wolfgang Amadeus Mozart": "classical", "Johann Sebastian Bach": "classical",
+    "Frédéric Chopin": "classical", "Ludwig van Beethoven": "classical",
+    "Wolfgang Amadeus Mozart": "classical", "Johann Sebastian Bach": "classical",
 }
 
 
@@ -409,7 +418,7 @@ def _get_ytdl():
         import shutil
         from yt_dlp.networking.impersonate import ImpersonateTarget
         deno_path = shutil.which('deno')
-        _ytdl = yt_dlp.YoutubeDL({
+        options = {
             'quiet': True,
             'noplaylist': True,
             'skip_download': True,
@@ -421,13 +430,12 @@ def _get_ytdl():
             'force_ipv4': True,
             'js_runtimes': {'deno': {'path': deno_path}} if deno_path else {'deno': {}},
             'remote_components': ['ejs:github'],
-            'http_headers': {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
-                              'AppleWebKit/537.36 (KHTML, like Gecko) '
-                              'Chrome/126.0 Safari/537.36',
-                'Accept': '*/*',
-            },
-        })
+            'http_headers': {'Accept': '*/*'},
+        }
+        cookie_file = os.environ.get('DJ_YTDLP_COOKIES_FILE', '').strip()
+        if cookie_file and os.path.isfile(cookie_file):
+            options['cookiefile'] = cookie_file
+        _ytdl = yt_dlp.YoutubeDL(options)
     return _ytdl
 
 def _reset_ytdl():
@@ -910,6 +918,39 @@ def preprocessed_count(place=None):
                                 (place,)).fetchone()[0]
         return conn.execute("SELECT COUNT(*) FROM Preprocessed").fetchone()[0]
     return _db_exec(_run)
+
+
+def recycle_played_songs(n=20, place=None):
+    """Pull up to n already-played, feature-complete songs back for reuse once
+    every discoverable candidate has been played, so the DJ keeps playing
+    forever instead of running dry. Random rows are sampled from the scored
+    Songs table (rows must carry a likeability to survive delete_unscored_songs).
+
+    Returns an (possibly empty) list of song dicts — empty only when nothing
+    was ever played/scored yet, in which case fresh discovery is still the only
+    source and playback simply keeps waiting for it."""
+    def _run(conn):
+        cols = [d[0] for d in conn.execute("SELECT * FROM Songs LIMIT 0").description]
+        if place and PLACE_GENRES.get(place):
+            genres = list(PLACE_GENRES[place])
+            marks = ",".join("?" for _ in genres)
+            rows = conn.execute(
+                f"SELECT * FROM Songs WHERE likeability IS NOT NULL "
+                f"AND genre IN ({marks}) ORDER BY RANDOM() LIMIT ?",
+                (*genres, n),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT * FROM Songs WHERE likeability IS NOT NULL "
+                "ORDER BY RANDOM() LIMIT ?",
+                (n,),
+            ).fetchall()
+        return [dict(zip(cols, r)) for r in rows]
+    try:
+        return _db_exec(_run)
+    except Exception as e:
+        print("Recycle failed:", e)
+        return []
 
 
 if __name__=="__main__":

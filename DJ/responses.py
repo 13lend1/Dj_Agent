@@ -264,7 +264,10 @@ def mark_song_played(song_id):
     updated = False
     with DB_LOCK:
         conn = _get_conn()
-        rows = conn.execute("SELECT id, songs_json, played FROM Agent").fetchall()
+        rows = conn.execute(
+            "SELECT id, songs_json, played FROM Agent "
+            "WHERE COALESCE(LOWER(TRIM(played)), '') != 'played'"
+        ).fetchall()
         for run_id, songs_text, played_text in rows:
             # Fast path: a run flagged as fully played can never contain an
             # unplayed song, so skip it before the (growing) songs_json parse.

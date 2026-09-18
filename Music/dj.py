@@ -247,16 +247,15 @@ class DJ(PreloadedPlayer):
             records, current=current, clip_length=self.clip_length, place=getattr(self, 'place', None)
         ) if records else []
 
-        # Agent-approved songs are persisted to the Songs table (the linear
-        # model's prediction); reorder=True moves them to the table end so
-        # the table rows stay sequential in the current play order.
+        # Agent-approved songs are persisted to the Songs table (metadata only —
+        # likeability/confidence are written exclusively by songs.save() from real
+        # listening signals); reorder=True moves them to the table end so the
+        # table rows stay sequential in the current play order.
         for song in playlist:
-            likeability = song.get('likeability')
-            if likeability is not None:
-                try:
-                    save_song_metadata(song, likeability=likeability, reorder=True)
-                except Exception as e:
-                    print("Save predicted likeability failed:", e)
+            try:
+                save_song_metadata(song, reorder=True)
+            except Exception as e:
+                print("Save song metadata failed:", e)
 
         with self.batch_lock:
             self.batch.extend(playlist)
@@ -691,25 +690,41 @@ class DJ(PreloadedPlayer):
             samples = np.tanh(samples / 32768.0) * 32768.0
         return np.clip(samples, -32768, 32767).astype(np.int16)
 
-    def _score_current_song(self):
-        """Likeability stays the model's prediction for the song, unless the
-        audience input a 0-9 rating — then rating/9 wins. Only scores; the
-        genre record + Agent-run mark are settled by the background
+    def _score_current_song(self, end_reason='finished'):
+        """Settle the outgoing song's row in Songs: record how it ended
+        (skipped/finished/interrupted) and, for skips, the second where the
+        skip happened. Likeability stays the model's prediction for the song,
+        unless the audience rated it — then like (0) / dislike (1) wins. Only
+        scores; the genre record + Agent-run mark are settled by the background
         _mark_worker so this never blocks the audio loop."""
         with self.lock:
             song = dict(self.current_song)
+            seconds_listened = self.current_elapsed
+            if seconds_listened is None and self.current_start_time is not None:
+                seconds_listened = time.time() - self.current_start_time
             score = self.current_rating
 
+        liked = None
         if score is not None:
-            likeability = round(score / 9, 2)
-        else:
-            predicted = song.get('likeability')
-            if predicted is None:
-                predicted = song.get('score') or 0.0
-            likeability = round(float(predicted), 2)
+            liked = score if score in (0, 1) else None
 
-        print(f"'{song['name']}' likeability: {likeability}", flush=True)
+        predicted = song.get('likeability')
+        if predicted is None:
+            predicted = song.get('score') or 0.0
+        likeability = round(float(predicted), 2)
+
+        skipp = None
+        if end_reason == 'skipped' and seconds_listened is not None:
+            skipp = round(seconds_listened, 2)
+
+        print(f"'{song['name']}' likeability: {likeability}, "
+              f"end_reason: {end_reason}, liked: {liked}, skipp: {skipp}", flush=True)
         song['score'] = likeability
+        song['likeability'] = likeability
+        song['liked'] = liked
+        song['skipp'] = skipp
+        song['end_reason'] = end_reason
+        song['replayed'] = 0
         self.save_queue.put(song)
 
     def _crossfade(self, out_process, in_process, stream, secs, effect=None):
@@ -1112,7 +1127,7 @@ class DJ(PreloadedPlayer):
 
                     if not self._transition_scored:
                         self._transition_scored = True
-                        self._score_current_song()
+                        self._score_current_song(end_reason='skipped')
 
                     if not self.replay_event.is_set():
                         if transitions.get('type') != 'cut':
@@ -1163,7 +1178,7 @@ class DJ(PreloadedPlayer):
                             with self.lock:
                                 self.current_elapsed = elapsed
                             song_for_played = dict(self.current_song) if self.current_song is not None else None
-                            self._score_current_song()
+                            self._score_current_song(end_reason='finished')
                             if not self.replay_event.is_set():
                                 if transitions.get('type') != 'cut':
                                     print(f"\nCrossfading to next: {transitions.get('note', '')}")
@@ -1251,7 +1266,7 @@ class DJ(PreloadedPlayer):
                         if not self._holding:
                             with self.lock:
                                 self.current_elapsed = time.time() - self.current_start_time
-                            self._score_current_song()
+                            self._score_current_song(end_reason='interrupted' if early else 'finished')
 
                     fade = crossfade_sec if (crossfade_sec and crossfade_sec > 0) else self.DEFAULT_TRANSITION['crossfade_sec']
                     next_song = self._safe_advance(current, stream, fade, effect=effect)

@@ -743,6 +743,47 @@ def _db_exec(fn, *args, retries=5):
     raise last
 
 
+def compute_likeability_and_confidence(end_reason, skip_position_sec, hook_length_sec,
+                                       replayed, liked, saved):
+    # explicit dislike overrides everything else
+    if liked is False:
+        return 0.0, 1.0
+
+    score = 500
+    if end_reason == 'skipped' and skip_position_sec is not None and hook_length_sec:
+        pct_through = skip_position_sec / hook_length_sec
+        score -= 500 * (1 - pct_through)
+    if end_reason == 'interrupted':
+        score = 500
+    if replayed:
+        score += 350
+    if liked is True:
+        score += 150
+    if saved:
+        score += 200
+    score = max(0, min(1000, score))
+    likeability = score / 1000
+
+    # confidence: max across whichever signals fired, not additive
+    confidences = [0.0]
+    if end_reason == 'interrupted':
+        confidences.append(0.1)
+    if end_reason == 'finished' and not (replayed or liked is not None or saved):
+        confidences.append(0.3)
+    if end_reason == 'skipped':
+        pct_through = (skip_position_sec / hook_length_sec) if hook_length_sec else 0
+        confidences.append(1.0 if pct_through < 0.3 else 0.6)
+    if replayed:
+        confidences.append(1.0)
+    if liked is True:
+        confidences.append(1.0)
+    if saved:
+        confidences.append(1.0)
+
+    confidence = max(confidences)
+    return likeability, confidence
+
+
 def save(song):
     required = ['bpm', 'energy', 'danceability', 'valence', 'acousticness', 'instrumentalness']
     if not all(song.get(k) is not None for k in required):
@@ -754,20 +795,51 @@ def save(song):
         song.update(features)
 
     def _run(conn):
+        liked_db = song.get('liked')  # 0=like, 1=dislike, None=unrated
+        if liked_db is None:
+            liked = None
+        else:
+            liked = liked_db == 0
+        hook_length = song.get('hook_length')
+        if hook_length is None:
+            start = song.get('play_start_sec')
+            end = song.get('play_end_sec')
+            if start is not None and end is not None:
+                hook_length = round(max(0.0, end - start), 1)
+        likeability, confidence = compute_likeability_and_confidence(
+            end_reason=song.get('end_reason'),
+            skip_position_sec=song.get('skipp'),
+            hook_length_sec=hook_length,
+            replayed=bool(song.get('replayed', 0)),
+            liked=liked,
+            saved=bool(song.get('saved', 0)),
+        )
         conn.execute(
             """
             INSERT INTO Songs
                 (id, name, artist, album, genre, year, link, duration,
-                bpm, energy, danceability, valence, acousticness, instrumentalness, likeability)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(id) DO UPDATE SET likeability = excluded.likeability
+                bpm, energy, danceability, valence, acousticness, instrumentalness,
+                likeability, confidence, liked, skipp, end_reason, replayed, saved, hook_length, place)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+                likeability = COALESCE(excluded.likeability, Songs.likeability),
+                confidence = excluded.confidence,
+                liked = COALESCE(excluded.liked, Songs.liked),
+                skipp = excluded.skipp,
+                end_reason = excluded.end_reason,
+                replayed = MAX(COALESCE(Songs.replayed, 0), COALESCE(excluded.replayed, 0)),
+                saved = MAX(COALESCE(Songs.saved, 0), COALESCE(excluded.saved, 0)),
+                hook_length = COALESCE(excluded.hook_length, Songs.hook_length),
+                place = COALESCE(excluded.place, Songs.place)
             """,
             (
                 song['id'], song['name'], song['artist'], song['album'],
                 song['genre'], song['year'], song['link'], song['duration'],
                 song['bpm'], song['energy'], song['danceability'],
                 song['valence'], song['acousticness'], song['instrumentalness'],
-                song['score'],
+                likeability, confidence, song.get('liked'), song.get('skipp'),
+                song.get('end_reason'), song.get('replayed', 0),
+                song.get('saved', 0), hook_length, song.get('place'),
             ),
         )
     _db_exec(_run)

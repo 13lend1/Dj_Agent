@@ -1,7 +1,7 @@
 # Set the default place here (must be a key in PLACE_GENRES).
 # Override with --resume-place <key> on the command line or
 # DJ_RESUME_PLACE=<key> env variable.
-DEFAULT_PLACE = "study"
+DEFAULT_PLACE = "car"
 
 PLACE_GENRES = {
     "car": [

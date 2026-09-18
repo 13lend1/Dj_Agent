@@ -363,6 +363,7 @@ class Agent:
             song["play_start"] = self._fmt(start)
             song["play_end"] = self._fmt(end)
             song["clip_length"] = round(max(0.0, end - start), 1)
+            song["hook_length"] = round(max(0.0, end - start), 1)
             song["_gemini_transition"] = {
                 "type": entry.get("transition_type"),
                 "crossfade_bars": entry.get("crossfade_bars"),
@@ -395,6 +396,7 @@ class Agent:
                 song["play_start"] = self._fmt(start)
                 song["play_end"] = self._fmt(end)
                 song["clip_length"] = round(max(0.0, end - start), 1)
+                song["hook_length"] = round(max(0.0, end - start), 1)
                 song["_gemini_transition"] = None
                 playlist.append(song)
         if fallback_count:

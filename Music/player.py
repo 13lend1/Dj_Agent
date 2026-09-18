@@ -28,6 +28,7 @@ class Player:
         self.current_url = None
         self.current_rating = None
         self.lock = threading.Lock()
+        self._last_scored_song_id = None
 
         threading.Thread(target=self._save_worker, daemon=True).start()
         self._ensure_genre_tables()
@@ -255,7 +256,7 @@ class Player:
                         if self.stop_event.is_set():
                             break
 
-                        current_song, current = self._next_play(current, get_next_song)
+                        current_song, current = self._next_play(current, get_next_song, end_reason='skipped')
 
                         if current_song is None:
                             print("No more songs available.")
@@ -288,6 +289,14 @@ class Player:
                     stream.write(data)
 
         finally:
+            try:
+                with self.lock:
+                    song = dict(self.current_song) if self.current_song is not None else None
+                if song is not None and song.get('id') != self._last_scored_song_id:
+                    self._score_current_song(end_reason='interrupted')
+            except Exception as e:
+                print("Interrupted-song scoring failed:", e)
+
             with self.lock:
                 self.current_process = None
 
@@ -345,44 +354,54 @@ class Player:
 
         print(f"Rating queued for '{title}': {score}")
 
-    def _score_current_song(self):
+    def _score_current_song(self, end_reason='interrupted'):
         with self.lock:
             song = dict(self.current_song)
             seconds_listened = self.current_elapsed
+            if seconds_listened is None and self.current_start_time is not None:
+                seconds_listened = time.time() - self.current_start_time
             score = self.current_rating
 
         self._record_genre(song)
 
-        if not song.get('duration'):
-            return
-
-        listen_fraction = min(seconds_listened / (song['duration'] / 1000), 1.0)
-
+        liked = None
+        likeability = None
         if score is not None:
-            likeability = round(score / 9, 2)
-        else:
-            likeability = listen_fraction
+            liked = score if score in (0, 1) else None
+            likeability = 1.0 if liked == 0 else 0.0
+        elif song.get('duration') and seconds_listened is not None:
+            likeability = min(seconds_listened / (song['duration'] / 1000), 1.0)
 
-        print(f"'{song['name']}' likeability: {round(likeability, 2)}")
-        song['score'] = likeability
+        skipp = None
+        if end_reason == 'skipped' and seconds_listened is not None:
+            skipp = round(seconds_listened, 2)
+
+        print(f"'{song['name']}' end_reason: {end_reason}, liked: {liked}, skipp: {skipp}")
+        song['likeability'] = likeability
+        song['liked'] = liked
+        song['skipp'] = skipp
+        song['end_reason'] = end_reason
+        song['replayed'] = 0
         self.save_queue.put(song)
+        self._last_scored_song_id = song.get('id')
 
     def _score_replay(self, song):
-        """Likeability update for a replayed song (R): the only database change
-        this makes is writing that song's likeability column. A deliberate
-        replay is the strongest like signal, so it is set to 1.0."""
+        """Update for a replayed song: a deliberate replay is the strongest like signal."""
         with self.lock:
             song = dict(song)
 
         self._record_genre(song)
 
-        likeability = 1.0
-
-        print(f"'{song['name']}' replayed — likeability: {likeability}")
-        song['score'] = likeability
+        print(f"'{song['name']}' replayed — liked: 0 (like)")
+        song['likeability'] = 1.0
+        song['liked'] = 0
+        song['skipp'] = None
+        song['end_reason'] = 'finished'
+        song['replayed'] = 1
         self.save_queue.put(song)
+        self._last_scored_song_id = song.get('id')
 
-    def _next_play(self, current, get_next_song):
+    def _next_play(self, current, get_next_song, end_reason='finished'):
         """Settle the outgoing song and hand back (song, process) to play next,
         tracking the outgoing song as the previous one. Returns (None, None)
         when there is nothing left to play."""
@@ -394,7 +413,7 @@ class Player:
         except Exception:
             pass
 
-        self._score_current_song()
+        self._score_current_song(end_reason=end_reason)
 
         song = get_next_song()
         if song is None:
@@ -427,7 +446,7 @@ class Player:
             fd = sys.stdin.fileno()
             old_settings = termios.tcgetattr(fd)
 
-        print("n = next | s = stop | r = replay previous song | a = restart song | <- / -> = seek back / forward 5s | 0-9 = rate song (0.0-1.0)")
+        print("n = next | s = stop | r = replay previous song | a = restart song | <- / -> = seek back / forward 5s | 0 = like | 1 = dislike")
 
         try:
             if not is_windows:
@@ -498,7 +517,7 @@ class Player:
                     print("\nStopping...")
                     self.stop()
 
-                elif key.isdigit():
+                elif key in ('0', '1'):
                     score = int(key)
                     self.rate_current(score)
 

@@ -161,15 +161,14 @@ class PreloadedPlayer(Player):
             records = random.sample(candidates, min(self.top_n, len(candidates)))
 
         for song in records:
-            if 'likeability' in song and song['likeability'] is not None:
-                try:
-                    save_song_metadata(song, likeability=song['likeability'])
-                except Exception as e:
-                    print("Save predicted likeability failed:", e)
+            try:
+                save_song_metadata(song)
+            except Exception as e:
+                print("Save song metadata failed:", e)
 
         with self.batch_lock:
             self.batch.extend(records)
-        print(f"Queued batch of {len(records)} songs — predicted likeability saved (pool {self.pool_size}, best {self.top_n}).")
+        print(f"Queued batch of {len(records)} songs (pool {self.pool_size}, best {self.top_n}).")
 
     def get_next_song(self, timeout=None):
         start = time.time()
@@ -267,7 +266,7 @@ class PreloadedPlayer(Player):
                 continue
         return None
 
-    def _settle_next(self, current, get_next_song):
+    def _settle_next(self, current, get_next_song, end_reason='finished'):
         """Settle the outgoing song and hand back (song, process) to play next,
         tracking the outgoing song as the previous one. Returns (None, None)
         when there is nothing left to play."""
@@ -279,7 +278,7 @@ class PreloadedPlayer(Player):
         except Exception:
             pass
 
-        self._score_current_song()
+        self._score_current_song(end_reason=end_reason)
 
         song = self.get_preloaded_song()
         if song is None:
@@ -434,7 +433,7 @@ class PreloadedPlayer(Player):
                         if self.stop_event.is_set():
                             break
 
-                        current_song, current = self._settle_next(current, get_next_song)
+                        current_song, current = self._settle_next(current, get_next_song, end_reason='skipped')
 
                         if current_song is None:
                             print("No preloaded song available.")

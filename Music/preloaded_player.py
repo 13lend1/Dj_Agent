@@ -6,7 +6,7 @@ import threading
 import time
 import sounddevice as sd
 import traceback
-from songs import (
+from Music.songs import (
     get_random_song,
     get_random_songs,
     save_preprocessed,
@@ -15,7 +15,7 @@ from songs import (
     preprocessed_count,
     take_preprocessed_batch,
 )
-from player import Player
+from Music.player import Player
 
 
 class PreloadedPlayer(Player):
@@ -35,9 +35,11 @@ class PreloadedPlayer(Player):
         threading.Thread(target=self._batch_worker, daemon=True).start()
 
     def _load_model(self):
-        if self.model is None:
-            from Model.linear_regression import LinearRegressionModel
-            self.model = LinearRegressionModel()
+        # Per-place model: loads the place's pickle (or retrains it when >=15
+        # new records arrived). None when the place has <50 scored records yet,
+        # in which case the caller falls back to random selection.
+        from Model.linear_regression import ensure_place_model
+        self.model = ensure_place_model(getattr(self, 'place', None))
 
     def _refill_worker(self, low_water=None, check_interval=5):
         """Keep the Preprocessed pool topped up nonstop while the DJ is active.
@@ -153,7 +155,8 @@ class PreloadedPlayer(Player):
 
         try:
             self._load_model()
-            self.model.fit()
+            if self.model is None:
+                raise ValueError("No usable per-place model yet (need ≥ 50 scored records).")
             top = self.model.select_best(candidates, n=self.top_n)
             records = top.to_dict('records')
         except Exception as e:
@@ -297,7 +300,7 @@ class PreloadedPlayer(Player):
 
         return song, process
 
-    def play(self, first_song, get_next_song):
+    def play(self, first_song, get_next_song, sink=None):
 
         current = self.prepare_song(first_song['link'])
         with self.lock:

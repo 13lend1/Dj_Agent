@@ -6,7 +6,7 @@ import time
 import yt_dlp
 import subprocess
 import sounddevice as sd
-from songs import (
+from Music.songs import (
     save,
 )
 
@@ -22,6 +22,7 @@ class Player:
         self.seek_forward_event = threading.Event()
         self.seek_backward_event = threading.Event()
         self.last_song = None
+        self.current_song = None
         self.current_length = None
         self.current_elapsed = None
         self.current_process = None
@@ -117,7 +118,7 @@ class Player:
 
         return process
 
-    def play(self, first_song, get_next_song):
+    def play(self, first_song, get_next_song, sink=None):
 
         current_song = first_song
         current = self.prepare_song(current_song['link'])
@@ -305,7 +306,7 @@ class Player:
             except:
                 pass
 
-    def start(self, first_song, get_next_song):
+    def start(self, first_song, get_next_song, keyboard=True, sink=None):
 
         while first_song is None:
             if self.stop_event.is_set():
@@ -317,18 +318,19 @@ class Player:
 
         self.player_thread = threading.Thread(
             target=self.play,
-            args=(first_song, get_next_song),
+            args=(first_song, get_next_song, sink),
             daemon=True
         )
 
         self.player_thread.start()
 
-        self.keyboard_thread = threading.Thread(
-            target=self.keyboard_control,
-            daemon=True
-        )
+        if keyboard:
+            self.keyboard_thread = threading.Thread(
+                target=self.keyboard_control,
+                daemon=True
+            )
 
-        self.keyboard_thread.start()
+            self.keyboard_thread.start()
 
         return self.player_thread
 

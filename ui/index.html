@@ -1,0 +1,77 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>DJ Agent</title>
+  <link rel="stylesheet" href="/style.css?v=2">
+</head>
+<body>
+  <header>
+    <h1>DJ Agent</h1>
+    <div class="status-bar">
+      <span id="place-badge" class="badge">place —</span>
+      <span id="state-dot" class="dot off"></span>
+      <span id="state-label">starting…</span>
+    </div>
+  </header>
+
+  <main>
+    <section id="now-playing" class="card">
+      <h2>Now Playing</h2>
+      <p id="np-title" class="np-title">—</p>
+      <p id="np-artist" class="np-artist">—</p>
+      <p id="np-meta" class="np-meta"></p>
+      <button type="button" id="sound-cta" class="cta" hidden>Enable sound in browser</button>
+      <div class="progress">
+        <div id="progress-bar" class="progress-bar"></div>
+      </div>
+      <p id="np-time" class="np-time"></p>
+      <div class="ratings">
+        <button type="button" id="rate-like" class="rate up" title="Like (plays count as liked)">&#128077;</button>
+        <button type="button" id="rate-dislike" class="rate down" title="Dislike">&#128078;</button>
+      </div>
+    </section>
+
+    <section id="transport" class="card">
+      <h2>Transport</h2>
+      <div class="buttons">
+        <button type="button" data-action="seek-backward" title="-5s">&#9198; -5s</button>
+        <button type="button" data-action="restart" title="Restart song">&#8635; Restart</button>
+        <button type="button" data-action="previous" title="Listen to previous song (counts as a replay)">&#9198; Previous</button>
+        <button type="button" data-action="skip" title="Next (skip)">Skip &#9197;</button>
+        <button type="button" data-action="seek-forward" title="+5s">+5s &#9197;</button>
+        <button type="button" data-action="stop" class="danger" title="Stop DJ">&#9632; Stop</button>
+      </div>
+      <p id="control-msg" class="control-msg"></p>
+    </section>
+
+    <section id="queue" class="card">
+      <h2>Up Next <span id="queue-count"></span></h2>
+      <ol id="queue-list"></ol>
+    </section>
+
+    <section id="models" class="card">
+      <h2>Per-Place Models</h2>
+      <div class="buttons">
+        <button type="button" id="train-all">Train all ready places</button>
+      </div>
+      <table>
+        <thead>
+          <tr>
+            <th>Place</th>
+            <th>Records</th>
+            <th>Status</th>
+            <th></th>
+          </tr>
+        </thead>
+        <tbody id="models-body"></tbody>
+      </table>
+      <p id="models-msg" class="control-msg"></p>
+    </section>
+  </main>
+
+  <audio id="audio" preload="auto" style="display:none"></audio>
+  <script src="/app.js?v=5"></script>
+</body>
+</html>

@@ -22,7 +22,7 @@ except Exception:
 _DENO = {'deno': {'path': shutil.which('deno')}} if shutil.which('deno') else {'deno': {}}
 import sounddevice as sd
 
-from preloaded_player import PreloadedPlayer
+from Music.preloaded_player import PreloadedPlayer
 from DJ.agent import Agent
 from DJ.responses import last_run_songs, mark_song_played
 from songs import (
@@ -226,7 +226,8 @@ class DJ(PreloadedPlayer):
 
         try:
             self._load_model()
-            self.model.fit()
+            if self.model is None:
+                raise ValueError("No usable per-place model yet (need ≥ 50 scored records).")
             top = self.model.select_best(candidates, n=self.top_n)
             records = top.to_dict('records')
         except Exception as e:
@@ -953,26 +954,33 @@ class DJ(PreloadedPlayer):
         self.last_song = outgoing
         return next_song
 
-    def play(self, first_song, get_next_song):
+    def play(self, first_song, get_next_song, sink=None):
 
-        # Open the audio device FIRST: if that fails there is nothing to play,
-        # and we must not pretend to be playing (no preloads, no saves).
-        try:
-            stream = sd.RawOutputStream(
-                samplerate=44100,
-                channels=2,
-                dtype='int16',
-                blocksize=4096
-            )
-            stream.__enter__()
-        except Exception as e:
-            print(f"\nNO AUDIO OUTPUT AVAILABLE - no sound will play.\n{e}\n",
-                  flush=True)
+        # A browser sink replaces the machine audio device: the same PCM
+        # continues flowing to the UI's <audio> element instead of the speaker.
+        if sink is None:
+            # Open the audio device FIRST: if that fails there is nothing to
+            # play, and we must not pretend to be playing (no preloads, no
+            # saves).
             try:
-                stream.__exit__(None, None, None)
-            except Exception:
-                pass
-            return
+                stream = sd.RawOutputStream(
+                    samplerate=44100,
+                    channels=2,
+                    dtype='int16',
+                    blocksize=4096
+                )
+                stream.__enter__()
+            except Exception as e:
+                print(f"\nNO AUDIO OUTPUT AVAILABLE - no sound will play.\n{e}\n",
+                      flush=True)
+                try:
+                    stream.__exit__(None, None, None)
+                except Exception:
+                    pass
+                return
+        else:
+            stream = sink
+            stream.__enter__()
 
         try:
 

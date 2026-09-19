@@ -1,0 +1,192 @@
+:root {
+  --bg: #0f1117;
+  --card: #171a23;
+  --border: #262b3a;
+  --text: #e6e9f0;
+  --muted: #8b92a6;
+  --accent: #7c5cff;
+  --good: #2ecc71;
+  --bad: #e74c3c;
+  --warn: #f1c40f;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-family: "Segoe UI", system-ui, sans-serif;
+}
+
+header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 16px 24px;
+  border-bottom: 1px solid var(--border);
+  position: sticky;
+  top: 0;
+  background: var(--bg);
+  z-index: 2;
+}
+
+header h1 {
+  margin: 0;
+  font-size: 20px;
+  letter-spacing: 1px;
+}
+
+.status-bar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 14px;
+  color: var(--muted);
+}
+
+.badge {
+  background: var(--accent);
+  color: #fff;
+  border-radius: 999px;
+  padding: 4px 12px;
+  font-size: 12px;
+}
+
+.dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: var(--muted);
+}
+.dot.on { background: var(--good); box-shadow: 0 0 8px var(--good); }
+.dot.off { background: var(--bad); }
+
+main {
+  max-width: 920px;
+  margin: 0 auto;
+  padding: 24px;
+  display: grid;
+  gap: 20px;
+}
+
+.card {
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 20px;
+}
+
+.card h2 {
+  margin: 0 0 14px;
+  font-size: 15px;
+  text-transform: uppercase;
+  letter-spacing: 1px;
+  color: var(--muted);
+}
+
+.np-title { font-size: 26px; margin: 0; font-weight: 700; }
+.np-artist { margin: 4px 0 0; color: var(--muted); font-size: 15px; }
+.np-meta { margin: 8px 0 0; color: var(--accent); font-size: 13px; }
+
+.progress {
+  height: 8px;
+  background: var(--border);
+  border-radius: 999px;
+  margin: 16px 0 6px;
+  overflow: hidden;
+}
+.progress-bar {
+  height: 100%;
+  width: 0;
+  background: var(--accent);
+  transition: width 0.5s linear;
+}
+
+.np-time {
+  margin: 0;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+#sound-cta.cta {
+  margin: 12px 0 0;
+  padding: 10px 18px;
+  border: 1px solid var(--accent);
+  background: rgba(124, 92, 255, 0.12);
+  color: var(--accent);
+  border-radius: 10px;
+  cursor: pointer;
+  font-size: 14px;
+  font-weight: 600;
+}
+#sound-cta.cta:hover { background: var(--accent); color: #fff; }
+
+.ratings {
+  margin-top: 14px;
+  display: flex;
+  gap: 12px;
+}
+
+.rate {
+  font-size: 22px;
+  width: 52px;
+  height: 44px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--bg);
+  color: var(--text);
+  cursor: pointer;
+}
+.rate:hover { border-color: var(--accent); }
+.rate.active { border-color: var(--accent); background: var(--accent); }
+
+.buttons { display: flex; flex-wrap: wrap; gap: 10px; }
+
+.buttons button, #train-all {
+  border: 1px solid var(--border);
+  background: var(--bg);
+  color: var(--text);
+  padding: 9px 16px;
+  border-radius: 10px;
+  cursor: pointer;
+  font-size: 14px;
+}
+.buttons button:hover, #train-all:hover { border-color: var(--accent); }
+.buttons button.danger:hover { border-color: var(--bad); }
+
+.control-msg { min-height: 18px; margin: 10px 0 0; font-size: 13px; color: var(--muted); }
+
+#queue-list { margin: 0; padding-left: 20px; }
+#queue-list li { padding: 3px 0; color: var(--text); font-size: 14px; }
+#queue-list .q-artist { color: var(--muted); font-size: 12px; }
+
+table {
+  width: 100%;
+  border-collapse: collapse;
+  margin-top: 12px;
+  font-size: 14px;
+}
+th, td {
+  text-align: left;
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--border);
+}
+th { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: 0.5px; }
+
+.tag {
+  display: inline-block;
+  padding: 2px 10px;
+  border-radius: 999px;
+  font-size: 12px;
+  background: var(--border);
+  color: var(--muted);
+}
+.tag.ready { background: rgba(46, 204, 113, 0.15); color: var(--good); }
+.tag.waiting { color: var(--muted); }
+.tag.stale { background: rgba(241, 196, 15, 0.15); color: var(--warn); }
+
+.tag.retrain {
+  background: rgba(231, 76, 60, 0.15);
+  color: var(--bad);
+}

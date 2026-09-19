@@ -13,4 +13,6 @@ dependencies = [
     "category-encoders",
     "musicbrainzngs",
     "sounddevice",
+    "fastapi",
+    "uvicorn",
 ]

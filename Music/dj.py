@@ -38,6 +38,19 @@ EFFECTS_DIR = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "effects"
 )
 
+
+def _places_mod():
+    """The canonical place/genre module. Prefers Music.preference (the same
+    object songs.py and the web API use, so custom places are seen everywhere);
+    falls back to a bare `preference` import for standalone Music/dj.py runs."""
+    try:
+        from Music import preference
+        return preference
+    except ImportError:
+        import preference
+        return preference
+
+
 class DJ(PreloadedPlayer):
     """
     PreloadedPlayer + the selecting/ordering Agent.
@@ -50,7 +63,14 @@ class DJ(PreloadedPlayer):
     the hook end, and the rate/skip + save-to-Songs cycle is unchanged.
     """
 
-    def __init__(self, pool_size=50, top_n=15, clip_length=33, resume_unplayed=None, resume_place=None):
+    def __init__(self, pool_size=50, top_n=15, clip_length=33, resume_unplayed=None, resume_place=None, trial=False):
+        # TRIAL FAST-START: a place with nothing preprocessed yet plays its
+        # first ~10 fetched songs RAW (bypassing the model + Agent ordering) to
+        # get audio going as fast as possible; the normal model-scored, agent-
+        # ordered pipeline takes over once the trial budget is spent. Must be
+        # set before super().__init__() spawns the worker threads.
+        self._trial = trial
+        self._trial_budget = 10 if trial else 0
         # Resume set state MUST exist and be loaded before super().__init__()
         # starts the background worker threads: otherwise the batch worker
         # could build a fresh run and overwrite the newest saved run (and its
@@ -58,6 +78,12 @@ class DJ(PreloadedPlayer):
         # 1 resum 0 no resume
         if resume_place is None:
             resume_place = os.environ.get("DJ_RESUME_PLACE", "").strip().lower() or None
+        if resume_place is None:
+            # The place the user last picked in the web UI (Database/places.json).
+            try:
+                resume_place = _places_mod().get_active_place()
+            except Exception:
+                resume_place = None
         if resume_place is None:
             try:
                 from preference import DEFAULT_PLACE
@@ -105,6 +131,8 @@ class DJ(PreloadedPlayer):
         self._hold_wait_since = None
         self._holding = False
         self._hold_inflight = False  # at most one async ring-fence prep in flight
+        self._transitioning = False  # a crossfade is mixing right now (UI hint)
+        self._place_gen = 0          # bumped on place switch to void stale preloads
         # A process must have exactly one stdout pump: two readers divide its
         # PCM bytes between their buffers.
         self._readers = {}
@@ -206,6 +234,37 @@ class DJ(PreloadedPlayer):
         if not candidates:
             return
 
+        # TRIAL FAST-START: on a cold place (nothing preprocessed yet) the
+        # first ~10 fetched songs are played as fast as possible — skipping the
+        # model and the Gemini/Agent ordering. They still play their hook window
+        # (like any normal song), but the window is the deterministic clip
+        # fallback, which costs zero latency, so the first track can start
+        # downloading the moment it is discovered. Once the budget runs out the
+        # DJ switches to the normal model-scored, Gemini-ordered pipeline.
+        if getattr(self, '_trial', False):
+            take = min(min(self.top_n, self._trial_budget), len(candidates))
+            self._trial_budget -= take
+            if self._trial_budget <= 0:
+                self._trial = False
+            if take:
+                agent = getattr(self, 'agent', None)
+                if agent is None:
+                    return
+                clip_length = float(getattr(self, 'clip_length', 33) or 33.0)
+                for song in candidates[:take]:
+                    start, end = agent._clip_window(song, clip_length)
+                    song["play_start_sec"] = start
+                    song["play_end_sec"] = end
+                    song["play_start"] = agent._fmt(start)
+                    song["play_end"] = agent._fmt(end)
+                    song["clip_length"] = round(max(0.0, end - start), 1)
+                    song["hook_length"] = round(max(0.0, end - start), 1)
+                with self.batch_lock:
+                    self.batch.extend(candidates[:take])
+                print(f"Trial: queued {take} raw song(s) with fallback hooks "
+                      f"({self._trial_budget} trial songs left).", flush=True)
+            return
+
         unfiltered = candidates
         before = len(candidates)
         candidates = [c for c in candidates
@@ -227,7 +286,8 @@ class DJ(PreloadedPlayer):
         try:
             self._load_model()
             if self.model is None:
-                raise ValueError("No usable per-place model yet (need ≥ 50 scored records).")
+                raise ValueError("No usable per-place model yet (place has not "
+                                 "reached the scored-record threshold).")
             top = self.model.select_best(candidates, n=self.top_n)
             records = top.to_dict('records')
         except Exception as e:
@@ -326,6 +386,35 @@ class DJ(PreloadedPlayer):
         # popping songs off it as they are served, so callers that need the
         # full resume list (e.g. __main__) must not share that object.
         return list(playable)
+
+    def set_place(self, place, genres=None):
+        """Switch the active place at runtime: retarget fetching/selection to
+        the new place, drop the old queue so no stale track slips through, and
+        reload that place's resume set. `genres` defines a brand-new place.
+        The song currently playing finishes out; the next one is the new place.
+        """
+        pref = _places_mod()
+        if genres:
+            place = pref.add_place(place, genres)
+        if place and place not in pref.PLACE_GENRES:
+            raise ValueError(f"unknown place '{place}'")
+        place = place or None
+        with self.lock:
+            self.place = place
+            self.resume_place = place
+        with self.batch_lock:
+            self.batch = []
+        # Void any preload that was in flight for the old place, then clear the
+        # buffer so its already-decoded songs can't play.
+        self._place_gen += 1
+        self._clear_preloaded()
+        try:
+            self.arm_saved_set()
+        except Exception as e:
+            print("Could not reload the resume set for the new place:", e)
+        self._keep_preloaded(self.get_next_song)
+        print(f"Place switched to: {self.place or 'any'}", flush=True)
+        return self.place
 
     def get_next_song(self, timeout=None):
         """Serve the unplayed tracks of the saved Agent run first; once they run
@@ -571,6 +660,8 @@ class DJ(PreloadedPlayer):
         if self.stop_event.is_set():
             return
 
+        gen = self._place_gen
+
         try:
             process = self.prepare_song(song_info)
         except Exception as e:
@@ -591,6 +682,14 @@ class DJ(PreloadedPlayer):
 
         try:
             while not self.stop_event.is_set():
+                if gen != self._place_gen:
+                    # The place changed while this track was decoding: drop it
+                    # instead of parking an old-place song in the queue.
+                    try:
+                        process.kill()
+                    except Exception:
+                        pass
+                    return
                 try:
                     self.song_queue.put({
                         **song_info,
@@ -648,6 +747,12 @@ class DJ(PreloadedPlayer):
             self.current_length = song['duration']
             self.current_start_time = time.time() - start_offset
             self.current_rating = None
+            # A stale current_elapsed from the outgoing song made the new song's
+            # progress bar start near its end; drop it so the UI reads the fresh
+            # clock. Rebasing the pause clock keeps elapsed frozen if the song
+            # changed while still paused (pause + skip).
+            self.current_elapsed = None
+            self._pause_clock = time.time() if self.pause_event.is_set() else None
             self.current_clip_duration = (
                 (end - start) if (start is not None and end is not None) else None
             )
@@ -910,6 +1015,53 @@ class DJ(PreloadedPlayer):
 
         return float(np.clip(gain_in, min_gain, max_gain))
 
+    def _play_effect_intro(self, in_process, stream, effect):
+        """Drop a transition effect over the first moments of the incoming song.
+
+        Used by a hard skip: the outgoing track is already gone, so the next
+        song plays at full level underneath while the effect is mixed on top
+        (short fade-in, tail fade-out). Consumes about len(effect) of the
+        incoming stream, so the main loop simply carries on where this stops."""
+        if effect is None or not len(effect):
+            return
+        eff_len = len(effect)
+        eff_i = 0
+        eff_gain = 0.9
+        fade_in_frames = int(0.05 * 44100)
+        fade_out_frames = int(0.2 * 44100)
+        carry = b""
+        while not self.stop_event.is_set() and eff_i < eff_len:
+            try:
+                chunk = self._read_chunk(in_process, timeout=1.0)
+            except (OSError, ValueError):
+                chunk = b""
+            if chunk is None:
+                chunk = b""          # stalled, not ended: treat as silence
+            elif chunk == b"":
+                break                # incoming stream really ended
+            carry += chunk[:len(chunk) // 4 * 4]
+            nframes = len(carry) // 4
+            if nframes == 0:
+                continue
+            audio = np.frombuffer(carry[:nframes * 4], dtype=np.int16).astype(np.float64)
+            carry = carry[nframes * 4:]
+            have = min(nframes, eff_len - eff_i)
+            if have > 0:
+                idx = np.arange(eff_i, eff_i + have)
+                g = np.ones(have, dtype=np.float64)
+                if fade_in_frames > 0:
+                    head = idx < fade_in_frames
+                    g[head] *= (idx[head] + 1.0) / fade_in_frames
+                if fade_out_frames > 0:
+                    tail = eff_len - idx
+                    tail_mask = tail < fade_out_frames
+                    g[tail_mask] *= (tail[tail_mask] + 1.0) / fade_out_frames
+                audio[:have * 2] += (
+                    effect[eff_i:eff_i + have].reshape(-1) * (eff_gain * g).repeat(2)
+                )
+                eff_i += have
+            stream.write(self._soft_limit(audio).tobytes())
+
     def _advance(self, current, stream, crossfade_sec, effect=None, wait=False):
         """Move from the current (outgoing) process into the next: crossfade if
         requested (optionally layered with a transition effect clip), then kill
@@ -930,7 +1082,6 @@ class DJ(PreloadedPlayer):
             return None
         next_process = next_song['process']
         matched_gain = 1.0
-        consumed = 0.0
         if crossfade_sec and crossfade_sec > 0:
             # Never re-fire the same transition's effect if the same song pair
             # gets blended more than once (stalled pipeline retries). The sound
@@ -943,18 +1094,42 @@ class DJ(PreloadedPlayer):
                 self._last_transition_pair = pair
                 self._last_transition_at = now
             effect_samples = self._load_effect(effect)
-            matched_gain = self._crossfade(current, next_process, stream, crossfade_sec, effect=effect_samples)
-            consumed = crossfade_sec
-        try:
-            current.kill()
-        except Exception:
-            pass
-        self._begin_song(next_song, next_process, start_offset=consumed)
+            # Hand the deck to the incoming song BEFORE the blend. The new track
+            # is audibly fading in from this moment; swapping current_song only
+            # after the ~2s crossfade finished is what made every skip/transition
+            # look seconds behind in the UI. start_offset=0 (instead of the old
+            # `consumed`) keeps the elapsed timeline identical — the fade time
+            # still elapses — while the UI now switches instantly.
+            self._begin_song(next_song, next_process)
+            self.last_song = outgoing
+            self._transitioning = True
+            try:
+                matched_gain = self._crossfade(current, next_process, stream, crossfade_sec, effect=effect_samples)
+            finally:
+                self._transitioning = False
+            try:
+                current.kill()
+            except Exception:
+                pass
+        else:
+            # Hard cut (skip): the outgoing song stops immediately, the deck is
+            # handed to the next song, then the transition effect (if any) drops
+            # over its first moments.
+            try:
+                current.kill()
+            except Exception:
+                pass
+            self._begin_song(next_song, next_process)
+            self.last_song = outgoing
+            effect_samples = self._load_effect(effect)
+            if effect_samples is not None and len(effect_samples):
+                self._play_effect_intro(next_process, stream, effect_samples)
         self._play_gain = matched_gain
-        self.last_song = outgoing
         return next_song
 
     def play(self, first_song, get_next_song, sink=None):
+
+        self._sink = sink
 
         # A browser sink replaces the machine audio device: the same PCM
         # continues flowing to the UI's <audio> element instead of the speaker.
@@ -1102,6 +1277,9 @@ class DJ(PreloadedPlayer):
                         self.current_process = current
                         self.current_start_time = time.time() - target
                         self.current_elapsed = None
+                        # Rebase the pause clock: elapsed must stay frozen from
+                        # the seek point if a seek lands while paused.
+                        self._pause_clock = time.time() if self.pause_event.is_set() else None
                         self.current_clip_duration = (
                             (end - (start + target)) if end is not None else None
                         )
@@ -1111,6 +1289,48 @@ class DJ(PreloadedPlayer):
 
                     print(f"\nSeeked to {target:.1f}s into the hook: "
                           f"{self.current_title} {self._fmt_hook(song)}", flush=True)
+                    continue
+
+                if self.pause_event.is_set():
+
+                    # Freeze the deck: no audio is written and the elapsed clock
+                    # stands still (resume shifts current_start_time forward by
+                    # the paused duration, so every elapsed reading stays
+                    # correct). Skip still lands — it cuts straight to the next
+                    # preloaded song with NO crossfade, so nothing is heard while
+                    # paused; the new song stays frozen until resume.
+                    if self.skip_event.is_set():
+
+                        self.skip_event.clear()
+
+                        if self.stop_event.is_set():
+                            break
+
+                        with self.lock:
+                            self.current_elapsed = time.time() - self.current_start_time
+
+                        if not self._transition_scored:
+                            self._transition_scored = True
+                            self._score_current_song(end_reason='skipped')
+
+                        next_song = self._safe_advance(current, stream, 0.0)
+
+                        if next_song is not None:
+                            current = next_song['process']
+                            self._transition_scored = False
+                            self._dry_started = None
+                            self._advance_fail_count = 0
+                            self._hold_wait_since = None
+                            self._holding = False
+                            print(f"Paused — queued next song: "
+                                  f"{self.current_title} {self._fmt_hook(next_song)}",
+                                  flush=True)
+
+                    # Keep the preload buffer warm across the pause so resume is
+                    # instant (cheap no-op when a preload is already in flight).
+                    self._keep_preloaded(get_next_song)
+
+                    time.sleep(0.05)
                     continue
 
                 transitions = (
@@ -1141,7 +1361,10 @@ class DJ(PreloadedPlayer):
                         if transitions.get('type') != 'cut':
                             print(f"Crossfading out: {transitions.get('note', '')}")
 
-                    next_song = self._safe_advance(current, stream, crossfade_sec, effect=effect)
+                    # A skip is a hard cut, not a blend: the playing song stops
+                    # immediately and the transition effect (if any) plays over
+                    # the start of the next one.
+                    next_song = self._safe_advance(current, stream, 0.0, effect=effect)
 
                     if next_song is None:
                         # No preloaded song yet (slow preload / batch still

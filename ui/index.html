@@ -4,74 +4,127 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>DJ Agent</title>
-  <link rel="stylesheet" href="/style.css?v=2">
+  <link href="https://fonts.googleapis.com/css2?family=VT323&family=Special+Elite&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/style.css?v=14">
 </head>
 <body>
-  <header>
-    <h1>DJ Agent</h1>
-    <div class="status-bar">
-      <span id="place-badge" class="badge">place —</span>
-      <span id="state-dot" class="dot off"></span>
-      <span id="state-label">starting…</span>
+  <div class="page">
+    <header>
+      <div class="brand">
+        <span class="brand-mark">&#9675;</span>
+        <h1>DJ AGENT</h1>
+      </div>
+      <div class="status-bar">
+        <span id="place-badge" class="badge">place &#8212;</span>
+        <span class="status-led"><span id="state-dot" class="dot off"></span><span id="state-label">starting&#8230;</span></span>
+      </div>
+    </header>
+
+    <main>
+      <section id="player" class="player device" aria-label="MP3 player">
+        <div class="device-top">
+          <span class="device-name">DJ&#183;2000</span>
+          <span class="device-status"><i class="led"></i><span id="state-label2">STANDBY</span></span>
+        </div>
+
+        <div class="screen">
+          <div class="art-wrap" id="art-wrap">
+            <img id="cover-art" alt="album cover" decoding="async" fetchpriority="high">
+            <div class="art-fallback" id="art-fallback">&#9835;</div>
+          </div>
+
+          <div class="now-info">
+            <div id="np-title" class="np-title">&#8212;</div>
+            <div id="np-artist" class="np-artist">&#8212;</div>
+            <div id="np-meta" class="np-meta"></div>
+          </div>
+
+          <div class="audio-bar">
+            <div class="progress">
+              <div id="progress-bar" class="progress-bar"></div>
+            </div>
+            <div class="time-row">
+              <span id="np-time" class="np-time">0:00 / 0:00</span>
+            </div>
+            <button type="button" id="sound-cta" class="cta" hidden>&#9654; Enable sound in browser</button>
+          </div>
+
+          <div id="loading" class="loading" hidden>
+            <div class="spinner" aria-hidden="true"></div>
+            <div class="loading-title" id="loading-title">Getting songs ready&#8230;</div>
+            <div class="loading-sub" id="loading-sub">searching for tracks&#8230;</div>
+            <div class="loading-bar" id="loading-bar"><div id="loading-fill" class="loading-fill"></div></div>
+          </div>
+        </div>
+
+        <div class="transport">
+          <button type="button" data-action="previous" title="Listen to previous song (counts as a replay)">&#9198;</button>
+          <button type="button" data-action="restart" class="primary" title="Restart song">&#8635;</button>
+          <button type="button" id="pause-btn" data-action="pause" class="primary pause" title="Pause">&#9208;</button>
+          <button type="button" data-action="skip" class="primary" title="Next (skip)">&#9197;</button>
+          <button type="button" data-action="stop" class="stop" title="Stop DJ">&#9632;</button>
+        </div>
+
+        <div class="ratings">
+          <button type="button" id="rate-like" class="rate up" title="Like (plays count as liked)"><b>&#9829;</b> LIKE</button>
+          <button type="button" id="rate-dislike" class="rate down" title="Dislike"><b>&#10005;</b> DISLIKE</button>
+        </div>
+
+        <div class="speaker" aria-hidden="true">
+          <span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span>
+        </div>
+      </section>
+
+      <aside class="side">
+        <section id="queue" class="card queue-card">
+          <h2>&#9654; Up Next <span id="queue-count" class="count"></span></h2>
+          <ol id="queue-list"></ol>
+        </section>
+
+        <section id="place" class="card place-card">
+          <h2>&#127968; Place</h2>
+          <p class="place-hint">The DJ only plays the genres of the active place.</p>
+          <div class="place-current">
+            <span id="place-current-name" class="place-current-name">&#8212;</span>
+            <span id="place-current-genres" class="place-current-genres"></span>
+          </div>
+          <p class="place-hint">Press <b>&#9632; Stop</b> to change place.</p>
+        </section>
+      </aside>
+    </main>
+
+    <div id="control-msg" class="toast"></div>
+  </div>
+
+  <div id="place-gate" class="gate" hidden>
+    <div class="gate-panel">
+      <h2>Choose your place</h2>
+      <p class="gate-sub">The DJ won't start until you pick where you're listening.</p>
+
+      <div id="gate-places" class="gate-places"></div>
+
+      <details id="gate-create" class="gate-create">
+        <summary>Create a new place</summary>
+        <label class="field">
+          <span>Name</span>
+          <input id="gate-name" type="text" maxlength="24" placeholder="e.g. rooftop">
+        </label>
+        <div class="field">
+          <span>Genres</span>
+          <div id="gate-selected" class="chip-box chip-selected" aria-label="Selected genres"></div>
+          <div id="gate-genres" class="chip-box chip-available" aria-label="Available genres"></div>
+          <p class="chip-hint">Tap a genre to add it, tap it again to remove it.</p>
+        </div>
+        <div class="place-actions">
+          <button type="button" id="gate-create-btn">Create &amp; start</button>
+        </div>
+      </details>
+
+      <p id="gate-msg" class="control-msg"></p>
     </div>
-  </header>
-
-  <main>
-    <section id="now-playing" class="card">
-      <h2>Now Playing</h2>
-      <p id="np-title" class="np-title">—</p>
-      <p id="np-artist" class="np-artist">—</p>
-      <p id="np-meta" class="np-meta"></p>
-      <button type="button" id="sound-cta" class="cta" hidden>Enable sound in browser</button>
-      <div class="progress">
-        <div id="progress-bar" class="progress-bar"></div>
-      </div>
-      <p id="np-time" class="np-time"></p>
-      <div class="ratings">
-        <button type="button" id="rate-like" class="rate up" title="Like (plays count as liked)">&#128077;</button>
-        <button type="button" id="rate-dislike" class="rate down" title="Dislike">&#128078;</button>
-      </div>
-    </section>
-
-    <section id="transport" class="card">
-      <h2>Transport</h2>
-      <div class="buttons">
-        <button type="button" data-action="seek-backward" title="-5s">&#9198; -5s</button>
-        <button type="button" data-action="restart" title="Restart song">&#8635; Restart</button>
-        <button type="button" data-action="previous" title="Listen to previous song (counts as a replay)">&#9198; Previous</button>
-        <button type="button" data-action="skip" title="Next (skip)">Skip &#9197;</button>
-        <button type="button" data-action="seek-forward" title="+5s">+5s &#9197;</button>
-        <button type="button" data-action="stop" class="danger" title="Stop DJ">&#9632; Stop</button>
-      </div>
-      <p id="control-msg" class="control-msg"></p>
-    </section>
-
-    <section id="queue" class="card">
-      <h2>Up Next <span id="queue-count"></span></h2>
-      <ol id="queue-list"></ol>
-    </section>
-
-    <section id="models" class="card">
-      <h2>Per-Place Models</h2>
-      <div class="buttons">
-        <button type="button" id="train-all">Train all ready places</button>
-      </div>
-      <table>
-        <thead>
-          <tr>
-            <th>Place</th>
-            <th>Records</th>
-            <th>Status</th>
-            <th></th>
-          </tr>
-        </thead>
-        <tbody id="models-body"></tbody>
-      </table>
-      <p id="models-msg" class="control-msg"></p>
-    </section>
-  </main>
+  </div>
 
   <audio id="audio" preload="auto" style="display:none"></audio>
-  <script src="/app.js?v=5"></script>
+  <script src="/app.js?v=19"></script>
 </body>
 </html>

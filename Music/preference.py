@@ -68,6 +68,112 @@ PLACE_GENRES = {
     ],
 }
 
+# ---- custom places (created from the web UI, persisted) -------------------
+#
+# A place is just a name -> [genres] mapping. Users can create their own from
+# the UI; they are merged into PLACE_GENRES at import (so song fetching and the
+# per-place model pick them up) and saved to Database/places.json so they
+# survive a restart. The same file remembers which place was last active.
+
+import json as _json
+import os as _os_places
+import re as _re_places
+
+_PLACES_FILE = _os_places.path.join(
+    _os_places.path.dirname(_os_places.path.dirname(_os_places.path.abspath(__file__))),
+    "Database", "places.json",
+)
+_CUSTOM_PLACES = {}
+
+
+def normalize_place(name):
+    """Canonical place key: lowercase, non-alphanumerics collapsed to '_'."""
+    name = _re_places.sub(r"[^a-z0-9]+", "_", (name or "").strip().lower())
+    return name.strip("_")
+
+
+def _read_places_file():
+    try:
+        with open(_PLACES_FILE, encoding="utf-8") as fh:
+            data = _json.load(fh)
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _write_places_file(data):
+    try:
+        _os_places.makedirs(_os_places.path.dirname(_PLACES_FILE), exist_ok=True)
+        with open(_PLACES_FILE, "w", encoding="utf-8") as fh:
+            _json.dump(data, fh, indent=2)
+    except OSError as exc:
+        print("Could not save places file:", exc)
+    return data
+
+
+def load_custom_places():
+    """Merge user-created places from Database/places.json into PLACE_GENRES."""
+    data = _read_places_file()
+    for raw_key, genres in (data.get("places") or {}).items():
+        key = normalize_place(raw_key)
+        if not key or not isinstance(genres, list):
+            continue
+        clean = [str(g).strip().lower() for g in genres if str(g).strip()]
+        if clean:
+            _CUSTOM_PLACES[key] = clean
+            PLACE_GENRES[key] = clean
+    return dict(_CUSTOM_PLACES)
+
+
+def custom_places():
+    """The user-created places only (not the built-in PLACE_GENRES keys)."""
+    return dict(_CUSTOM_PLACES)
+
+
+def add_place(name, genres):
+    """Create (or replace) a user-defined place and persist it. Returns the
+    normalized key. Raises ValueError when the name or genres are unusable."""
+    key = normalize_place(name)
+    if not key:
+        raise ValueError("a place name is required")
+    clean = []
+    for genre in genres or []:
+        genre = str(genre).strip().lower()
+        if genre and genre not in clean:
+            clean.append(genre)
+    if not clean:
+        raise ValueError("pick at least one genre for the new place")
+    _CUSTOM_PLACES[key] = clean
+    PLACE_GENRES[key] = clean
+    data = _read_places_file()
+    data["places"] = dict(_CUSTOM_PLACES)
+    _write_places_file(data)
+    return key
+
+
+def get_active_place():
+    """The place the user last selected. Returns None when they never chose one;
+    returns "" when they explicitly chose 'any place'."""
+    data = _read_places_file()
+    if "active" not in data:
+        return None
+    return normalize_place(data.get("active"))
+
+
+def set_active_place(name):
+    """Persist the active place so the DJ resumes it on the next start. An
+    empty/None name means 'any place' (play every genre)."""
+    key = normalize_place(name)
+    if key and key not in PLACE_GENRES:
+        raise ValueError(f"unknown place '{name}'")
+    data = _read_places_file()
+    data["active"] = key or None
+    _write_places_file(data)
+    return key or None
+
+
+load_custom_places()
+
 GENRE_EFFECTS = {
     "classical": [
         "soft_air",

@@ -21,6 +21,8 @@ class Player:
         self.restart_event = threading.Event()
         self.seek_forward_event = threading.Event()
         self.seek_backward_event = threading.Event()
+        self.pause_event = threading.Event()
+        self._pause_clock = None
         self.last_song = None
         self.current_song = None
         self.current_length = None
@@ -30,6 +32,7 @@ class Player:
         self.current_rating = None
         self.lock = threading.Lock()
         self._last_scored_song_id = None
+        self._sink = None  # live output stream (StreamSink for the web UI)
 
         threading.Thread(target=self._save_worker, daemon=True).start()
         self._ensure_genre_tables()
@@ -84,6 +87,62 @@ class Player:
     def seek_backward(self):
         """Skip 5s back (falls back to the previous song at the start)."""
         self.seek_backward_event.set()
+
+    def pause(self):
+        """Freeze the deck: the play loop stops writing audio and the elapsed
+        clock stands still. Resume shifts the song's start time forward by the
+        paused duration, so every `time.time() - current_start_time` reading
+        (progress, hook window, scoring) picks up exactly where it left off."""
+        if self.pause_event.is_set():
+            return
+        with self.lock:
+            self._pause_clock = time.time()
+        self.pause_event.set()
+        sink = getattr(self, '_sink', None)
+        if sink is not None and hasattr(sink, 'note_paused'):
+            sink.note_paused(True)
+
+    def resume(self):
+        if not self.pause_event.is_set():
+            return
+        with self.lock:
+            if self._pause_clock is not None and self.current_start_time is not None:
+                self.current_start_time += time.time() - self._pause_clock
+            self._pause_clock = None
+        # Re-anchor wall-clock pacing BEFORE the loop wakes, otherwise the first
+        # post-pause write sees the whole paused span as lag and burst-flushes
+        # the audio buffered during the pause.
+        sink = getattr(self, '_sink', None)
+        if sink is not None and hasattr(sink, 'resync_clock'):
+            sink.resync_clock()
+        if sink is not None and hasattr(sink, 'note_paused'):
+            sink.note_paused(False)
+        self.pause_event.clear()
+
+    def toggle_pause(self):
+        if self.pause_event.is_set():
+            self.resume()
+        else:
+            self.pause()
+
+    @property
+    def paused(self):
+        return self.pause_event.is_set()
+
+    def elapsed_now(self):
+        """Seconds into the current song, paused time excluded, or None when
+        nothing is playing. Never holds the lock while the caller does."""
+        with self.lock:
+            return self._elapsed_locked()
+
+    def _elapsed_locked(self):
+        start = getattr(self, 'current_start_time', None)
+        if start is None:
+            return None
+        total = time.time() - start
+        if self.pause_event.is_set() and self._pause_clock is not None:
+            total -= time.time() - self._pause_clock
+        return max(0.0, total)
 
     def prepare_song(self, url, seek_to=None):
 

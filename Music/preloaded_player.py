@@ -36,8 +36,8 @@ class PreloadedPlayer(Player):
 
     def _load_model(self):
         # Per-place model: loads the place's pickle (or retrains it when >=15
-        # new records arrived). None when the place has <50 scored records yet,
-        # in which case the caller falls back to random selection.
+        # new records arrived). None when the place has too few scored records
+        # yet, in which case the caller falls back to random selection.
         from Model.linear_regression import ensure_place_model
         self.model = ensure_place_model(getattr(self, 'place', None))
 
@@ -57,7 +57,9 @@ class PreloadedPlayer(Player):
             low_water = self.pool_size
         top_n = getattr(self, 'top_n', None) or low_water
         high_water = getattr(self, 'prefill_high_water', None) or max(2 * low_water, low_water + top_n)
-        max_chunk = 50  # one fetch round is still snappy; the loop chains them
+        max_chunk = 10  # lean fetch rounds: the first batch needs only ~10, so
+        # small rounds start playback sooner and the loop chains them in the
+        # background instead of one big 50-song grab before anything plays
         dry_rounds = 0
         while not self.stop_event.is_set():
             try:
@@ -96,10 +98,11 @@ class PreloadedPlayer(Player):
                 last_print = 0
                 max_wait = 90.0  # hard cap: never wait forever for a tiny pool
 
-                # Don't stall playback waiting for a full pool: the first batch
-                # can start as soon as enough candidates to fill top_n exist,
-                # and a half-full pool after a short wait is better than silence.
-                min_needed = max(self.top_n, 3)
+                # Don't stall playback waiting for a full pool: the first batch plays the
+                # first ~10 fetched songs as soon as they exist (capped so a cold
+                # place never waits for the whole pipeline), and a half-full pool
+                # after a short wait is better than silence.
+                min_needed = 1 if getattr(self, '_trial', False) else min(max(self.top_n, 3), 10)
 
                 while not self.stop_event.is_set():
                     count = preprocessed_count(place=getattr(self, 'place', None))
@@ -156,7 +159,8 @@ class PreloadedPlayer(Player):
         try:
             self._load_model()
             if self.model is None:
-                raise ValueError("No usable per-place model yet (need ≥ 50 scored records).")
+                raise ValueError("No usable per-place model yet (place has not "
+                                 "reached the scored-record threshold).")
             top = self.model.select_best(candidates, n=self.top_n)
             records = top.to_dict('records')
         except Exception as e:
@@ -268,6 +272,25 @@ class PreloadedPlayer(Player):
             except queue.Empty:
                 continue
         return None
+
+    def _clear_preloaded(self):
+        """Kill and drop every track waiting in the preload buffer (the active
+        place changed, so its tracks must not play)."""
+        while not self.song_queue.empty():
+            try:
+                song_info = self.song_queue.get_nowait()
+            except queue.Empty:
+                break
+            process = song_info.get('process') if isinstance(song_info, dict) else None
+            if process is not None:
+                try:
+                    process.kill()
+                except Exception:
+                    pass
+                try:
+                    process.stdout.close()
+                except Exception:
+                    pass
 
     def _settle_next(self, current, get_next_song, end_reason='finished'):
         """Settle the outgoing song and hand back (song, process) to play next,

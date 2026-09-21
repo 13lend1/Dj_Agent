@@ -4,7 +4,8 @@ const $ = (id) => document.getElementById(id);
 
 const CONTROL_URL = "/api/control";
 const STATUS_URL = `${CONTROL_URL}/status`;
-const MODELS_URL = "/api/models";
+const PLACES_URL = `${CONTROL_URL}/places`;
+const PLACE_URL = `${CONTROL_URL}/place`;
 
 async function getJSON(url) {
   const res = await fetch(url);
@@ -25,22 +26,70 @@ async function post(url, body) {
 const audio = $("audio");
 let audioOn = false;
 
+const COVER_URL = `${CONTROL_URL}/cover`;
+let lastSongKey = "";
+let coverRequest = 0;
+let lastCoverUrl = "";
+
+const STREAM_URL = "/api/control/stream";
+
+let audioBuffering = false;
+let lastReconnectAt = 0;
+let stallTimer = null;
+
 function startAudio() {
   if (audioOn) return;
-  audio.src = "/api/control/stream";
+  audio.src = `${STREAM_URL}?_=${Date.now()}`;
   audio
     .play()
     .then(() => { audioOn = true; $("sound-cta").hidden = true; })
     .catch((e) => flash(`audio blocked: ${e.message}`));
 }
 
-function reconnectAudio() {
+function reconnectAudio(opts) {
   if (!audioOn) return;
-  const src = audio.src;
-  audio.src = "";
+  const now = Date.now();
+  if (now - lastReconnectAt < 1200) return; // don't livelock on a wild blip
+  lastReconnectAt = now;
+  // Force a brand-new connection: reusing the same URL lets the browser keep
+  // playing (and re-buffer) audio the DJ has already moved past, which is what
+  // made skips/seeks feel seconds behind. The cache-buster guarantees a fresh
+  // stream subscribed at the live edge (and pre-seeded, so it starts at once).
+  // When `fresh` is set (skip / previous / restart), the subscription skips the
+  // pre-seed too: replaying the outgoing song's last ~0.75s read as "the next
+  // song is buffering", so these cuts land cleanly on the new song instead.
+  audioBuffering = true;
+  const freshQ = (opts && opts.fresh) ? "&fresh=1" : "";
+  audio.src = `${STREAM_URL}?_=${now}${freshQ}`;
   audio.load();
-  audio.src = src;
   audio.play().catch(() => {});
+}
+
+function resyncSoon() {
+  // A stalled element (waiting/stalled fired but the DJ says it's still
+  // playing) reconnects after a short debounce. This is the self-heal for the
+  // moments nothing is being written to the sink (e.g. a slow download between
+  // two songs) — show BUFFERING briefly, then snap back to the live edge.
+  clearTimeout(stallTimer);
+  stallTimer = setTimeout(() => { if (audioOn && audioBuffering) reconnectAudio(); }, 1500);
+}
+
+function bindAudioWatchdog() {
+  // A live HTTP stream has no standard "buffering" state we can trust, so the
+  // element's own events drive it: the moment it reports it can't advance
+  // while the DJ is still playing, snap to the live edge instead of leaving
+  // the page silently stuck on a buffer.
+  audio.addEventListener("waiting", () => { audioBuffering = true; resyncSoon(); });
+  audio.addEventListener("stalled", () => { audioBuffering = true; resyncSoon(); });
+  audio.addEventListener("playing", () => { audioBuffering = false; clearTimeout(stallTimer); });
+  audio.addEventListener("canplay", () => { audioBuffering = false; clearTimeout(stallTimer); });
+  audio.addEventListener("error", () => {
+    if (audioOn) setTimeout(reconnectAudio, 400);
+  });
+  audio.addEventListener("ended", () => {
+    // Server closed the stream (sink shut down) or the connection died.
+    if (audioOn) reconnectAudio();
+  });
 }
 
 function fmt(sec) {
@@ -51,133 +100,522 @@ function fmt(sec) {
   return `${m}:${s}`;
 }
 
-function renderStatus(s) {
-  if (!s.dj_running) {
-    $("state-dot").className = "dot off";
-    $("state-label").textContent = "DJ not running";
-    $("np-title").textContent = "—";
-    $("np-artist").textContent = "—";
-    $("np-meta").textContent = "";
-    $("progress-bar").style.width = "0%";
-    $("np-time").textContent = "";
-    $("queue-list").innerHTML = "";
+function setCoverImage(url) {
+  const img = $("cover-art");
+  const fb = $("art-fallback");
+  if (!url) {
+    img.hidden = true;
+    fb.hidden = false;
+    return;
+  }
+  const req = ++coverRequest;
+  const loader = new Image();
+  loader.onload = () => {
+    if (req !== coverRequest) return;
+    img.src = url;
+    img.hidden = false;
+    fb.hidden = true;
+    img.classList.add("ready");
+  };
+  loader.onerror = () => {
+    if (req !== coverRequest) return;
+    img.hidden = true;
+    fb.hidden = false;
+  };
+  loader.src = url;
+}
+
+async function refreshCover(song) {
+  if (!song || !song.title) {
+    setCoverImage(null);
+    return;
+  }
+  const key = `${song.artist || ""}|${song.title}`;
+  if (key === lastSongKey) return;
+  lastSongKey = key;
+  lastCoverUrl = "";
+  $("cover-art").classList.remove("ready");
+  try {
+    const qs = new URLSearchParams({
+      artist: song.artist || "",
+      title: song.title || "",
+    });
+    const d = await getJSON(`${COVER_URL}?${qs.toString()}`);
+    lastCoverUrl = d.url || "";
+    setCoverImage(lastCoverUrl);
+  } catch (e) {
+    console.warn("cover lookup failed:", e);
+    setCoverImage(null);
+  }
+}
+
+function setDeviceStatus(playing) {
+  document.body.classList.toggle("playing", !!playing);
+}
+
+function setPauseButton(paused) {
+  const btn = $("pause-btn");
+  if (!btn) return;
+  btn.classList.toggle("paused", !!paused);
+  btn.innerHTML = paused ? "&#9654;" : "&#9208;";
+  btn.title = paused ? "Resume" : "Pause";
+}
+
+// ---------------------------------------------------------------------------
+// Progress bar
+//
+// The server can only tell us where the deck is once a second, which makes the
+// bar look frozen or jumpy. Instead we remember the last reported position and
+// let the bar advance locally between polls, then re-anchor on every poll.
+// ---------------------------------------------------------------------------
+const progress = {
+  songKey: "",
+  elapsed: 0,
+  durSec: null,
+  paused: true,
+  active: false,
+  at: performance.now(),
+  like: null,
+};
+
+function paintProgress() {
+  const p = progress;
+  let shown = p.elapsed;
+  if (p.active && !p.paused) shown += (performance.now() - p.at) / 1000;
+  if (p.durSec && p.durSec > 0) shown = Math.min(shown, p.durSec);
+  shown = Math.max(0, shown);
+
+  const pct = (p.durSec && p.durSec > 0) ? (shown / p.durSec) * 100 : 0;
+  const width = Number.isFinite(pct) ? Math.min(100, Math.max(0, pct)) : 0;
+  const bar = $("progress-bar");
+  if (bar) bar.style.width = width.toFixed(1) + "%";
+
+  const time = $("np-time");
+  if (time) {
+    const txt = `${fmt(shown)} / ${p.durSec ? fmt(p.durSec) : "--:--"}` +
+      (p.like != null ? `  \u00b7  predicted ${p.like.toFixed(2)}` : "");
+    if (time.textContent !== txt) time.textContent = txt;
+  }
+}
+
+function updateProgress(song, playing, paused) {
+  if (!song) {
+    progress.songKey = "";
+    progress.elapsed = 0;
+    progress.durSec = null;
+    progress.paused = true;
+    progress.active = false;
+    progress.like = null;
+    paintProgress();
     return;
   }
 
+  const start = song.play_start_sec;
+  const end = song.play_end_sec;
+  const hookDur = (start != null && end != null && end > start) ? end - start : null;
+  const durSec = hookDur || (song.duration_ms ? song.duration_ms / 1000 : null);
+
+  progress.songKey = `${song.artist || ""}|${song.title || ""}|${song.genre || ""}`;
+  const serverElapsed = Number(song.elapsed_sec);
+  progress.elapsed = Number.isFinite(serverElapsed) ? serverElapsed : 0;
+  progress.durSec = durSec || null;
+  progress.like = song.likeability != null ? song.likeability : null;
+  progress.paused = paused || !playing;
+  progress.active = !!playing;
+  progress.at = performance.now();
+  paintProgress();
+}
+
+// ---------------------------------------------------------------------------
+// Status
+// ---------------------------------------------------------------------------
+let statusInFlight = false;
+let statusQueued = false;
+let pausePending = 0;
+let lastQueueSig = "";
+let lastStatus = null;
+
+function setLoading(s) {
+  // The deck is up but has nothing to play yet (freshly chosen place, empty
+  // pool): discovery is fetching + preprocessing the first tracks and the
+  // server reports how many are ready so far. Drive the "Getting songs ready"
+  // overlay (spinner + progress bar) instead of a blank STANDBY screen.
+  // NOTE: every element here is null-guarded — a missing element used to throw
+  // and silently froze the whole status render (bar never filled).
+  const overlay = $("loading");
+  if (overlay) overlay.hidden = !(s.dj_running && s.preparing && !s.stopping);
+  if (!overlay || overlay.hidden) return;
+
+  const bar = $("loading-bar");
+  const fill = $("loading-fill");
+  if (!bar || !fill) return;
+
+  const n = typeof s.ready_count === "number" ? s.ready_count : null;
+  const target = typeof s.ready_target === "number" && s.ready_target > 0 ? s.ready_target : 0;
+  bar.classList.toggle("indeterminate", !target || !!s.trial);
+  if (s.trial) {
+    // Cold-place trial fast-start: songs are being fetched and the first will
+    // play the moment it is downloaded. No point counting past the target here
+    // (the background fetch keeps climbing) — just show an indeterminate
+    // "starting playback" state.
+    fill.style.width = "0%";
+    $("loading-sub").textContent = "starting playback\u2026";
+    return;
+  }
+  if (target && n != null) {
+    fill.style.width = Math.min(100, Math.round((n / target) * 100)) + "%";
+    $("loading-sub").textContent = n >= target
+      ? `${n} tracks found \u00b7 mixing your first set\u2026`
+      : `${n} / ${target} tracks found`;
+  } else if (n != null) {
+    fill.style.width = "0%";
+    $("loading-sub").textContent = `${n} tracks found \u00b7 searching\u2026`;
+  } else {
+    fill.style.width = "0%";
+    $("loading-sub").textContent = "searching for tracks\u2026";
+  }
+}
+
+function renderStatus(s) {
+  lastStatus = s;
+  if (!s.dj_running) {
+    djAvailable = s.dj_available !== false;
+    // The deck is stopped (or waiting for a place): drop the audio and show the
+    // gate. Changing place is Stop -> pick -> Start, so this is the only screen
+    // that can retarget the DJ.
+    if (audioOn) { audio.pause(); audioOn = false; }
+    setDeviceStatus(false);
+    setPauseButton(false);
+    $("state-label2").textContent = "STANDBY";
+    $("state-dot").className = "dot off";
+    $("state-label").textContent = "choose a place";
+    $("np-title").textContent = "\u2014";
+    $("np-artist").textContent = "\u2014";
+    $("np-meta").textContent = "";
+    $("queue-list").innerHTML = "";
+    $("queue-count").textContent = "";
+    lastQueueSig = "";
+    lastSongKey = "";
+    setCoverImage(null);
+    updateProgress(null, false, true);
+    setLoading({ dj_running: false, preparing: false, stopping: false });
+    openGate();
+    return;
+  }
+
+  djAvailable = true;
+  closeGate();
+  const paused = !!s.paused;
+  const transitioning = !!s.transitioning;
+  if (!pausePending) {
+    setDeviceStatus(s.playing && !paused);
+    setPauseButton(paused);
+  }
   $("place-badge").textContent = `place ${s.place || "any"}`;
-  $("state-dot").className = "dot " + (s.playing ? "on" : "off");
-  $("state-label").textContent = s.playing ? "playing" : s.stopping ? "stopping" : "waiting";
-  $("sound-cta").hidden = s.playing && !audioOn ? false : true;
+  placesData.active = s.place || placesData.active;
+  renderPlaceCard();
+  $("state-dot").className = "dot " + (paused ? "paused" : s.playing ? "on" : "off");
+  $("state-label").textContent = paused ? "paused" : s.playing ? "playing" : s.stopping ? "stopping" : s.preparing ? "getting songs ready" : "waiting";
+  $("state-label2").textContent = paused ? "PAUSED"
+    : transitioning ? "MIXING"
+      : s.playing ? "PLAYING" : s.stopping ? "STOPPING" : s.preparing ? "LOADING" : "STANDBY";
+  // The element is gated on a live stream: while it reports buffering the DJ
+  // is still really playing, so surface it instead of a PLAYLESS PLAYING.
+  if (audioOn && audioBuffering && s.playing && !paused) {
+    $("state-dot").className = "dot paused";
+    $("state-label").textContent = "buffering\u2026";
+    $("state-label2").textContent = "BUFFERING";
+  }
+  $("sound-cta").hidden = !(s.playing && !audioOn);
 
   const song = s.song;
   if (song) {
-    $("np-title").textContent = song.title || "—";
-    $("np-artist").textContent = song.artist || "—";
-    const meta = [song.genre, song.place].filter(Boolean).join(" \u00b7 ");
-    $("np-meta").textContent = meta ? meta : "";
-    $("np-meta").textContent += song.play_start_sec != null && song.play_end_sec != null
-      ? ` \u00b7 hook ${fmt(song.play_start_sec)}-${fmt(song.play_end_sec)}`
-      : "";
-
-    const hookDur = (song.play_end_sec != null && song.play_start_sec != null)
-      ? song.play_end_sec - song.play_start_sec
-      : null;
-    const durSec = hookDur || (song.duration_ms ? song.duration_ms / 1000 : null);
-    let pct = 0;
-    if (durSec) pct = (song.elapsed_sec / durSec) * 100;
-    $("progress-bar").style.width = Math.min(100, Math.max(0, pct)).toFixed(1) + "%";
-    $("np-time").textContent = `${fmt(song.elapsed_sec)} / ${fmt(durSec)}` +
-      (song.likeability != null ? `  \u00b7  predicted ${song.likeability.toFixed(2)}` : "");
+    $("np-title").textContent = song.title || "\u2014";
+    $("np-artist").textContent = song.artist || "\u2014";
+    let meta = [song.genre, song.place].filter(Boolean).join(" \u00b7 ");
+    if (song.play_start_sec != null && song.play_end_sec != null) {
+      meta += `${meta ? " \u00b7 " : ""}hook ${fmt(song.play_start_sec)}-${fmt(song.play_end_sec)}`;
+    }
+    $("np-meta").textContent = meta;
 
     $("rate-like").className = "rate up" + (song.rating === 0 ? " active" : "");
     $("rate-dislike").className = "rate down" + (song.rating === 1 ? " active" : "");
+    refreshCover(song);
+  } else {
+    setCoverImage(null);
   }
 
+  updateProgress(song, s.playing, paused || pausePending > 0);
+
+  // After updateProgress (which resets the bar for a null song), let the
+  // preparing state take over the same bar with the load-progress fill.
+  setLoading(s);
+
   const q = s.queue || [];
-  $("queue-count").textContent = q.length ? `(${(s.resume_set || 0) + q.length})` : "";
-  $("queue-list").innerHTML = q.map((item) =>
-    `<li>${item.title} <span class="q-artist">${item.artist || ""}</span></li>`
-  ).join("");
+  $("queue-count").textContent = (q.length || s.resume_set)
+    ? `(${(s.resume_set || 0) + q.length})` : "";
+  const sig = q.map((i) => `${i.title}|${i.artist || ""}`).join("\n");
+  if (sig !== lastQueueSig) {
+    lastQueueSig = sig;
+    $("queue-list").innerHTML = q.map((item) =>
+      `<li>${item.title} <span class="q-artist">${item.artist || ""}</span></li>`
+    ).join("");
+  }
 }
 
-function renderModels(data) {
-  const models = data.models || [];
-  const rows = models.map((m) => {
-    let tag, cls = "tag";
-    if (!m.ready) { tag = `waiting: ${m.records}/${m.min_required}`; cls += " waiting"; }
-    else if (m.needs_retrain) {
-      tag = m.has_model ? "needs retrain" : "not trained yet";
-      cls += " retrain";
-    } else {
-      const left = m.retrain_after - (m.new_records_since_train ?? 0);
-      tag = `trained \u00b7 ${left} new until retrain`;
-      cls += " ready";
+async function refreshStatus() {
+  if (statusInFlight) {
+    // Never drop a request: remember that one is wanted and run it as soon as
+    // the in-flight response lands. Dropping it is what left the UI showing the
+    // old song for a whole poll after a click.
+    statusQueued = true;
+    return;
+  }
+  statusInFlight = true;
+  try {
+    renderStatus(await getJSON(STATUS_URL));
+  } catch (e) {
+    $("state-label").textContent = "offline";
+    console.warn("status poll failed:", e);
+  } finally {
+    statusInFlight = false;
+    if (statusQueued) {
+      statusQueued = false;
+      setTimeout(refreshStatus, 0);
     }
-    const action = m.ready
-      ? `<button type="button" data-train="${m.place}">Retrain</button>`
-      : `<span class="tag">${m.records} recs</span>`;
-    return `<tr>
-      <td><strong>${m.place}</strong><br><span class="q-artist">${m.genres.join(", ")}</span></td>
-      <td>${m.records}</td>
-      <td><span class="${cls}">${tag}</span></td>
-      <td>${action}</td>
-    </tr>`;
-  }).join("");
-  $("models-body").innerHTML = rows;
+  }
 }
 
+// The backend applies a control a beat after the POST returns (the audio loop
+// picks up the event, prepares the next track, then swaps current_song). Poll a
+// few times over the next second so the UI catches the new state quickly
+// instead of waiting for the next tick.
+function refreshStatusSoon() {
+  refreshStatus();
+  for (const delay of [200, 500, 1000]) {
+    setTimeout(refreshStatus, delay);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Places + startup gate
+//
+// The deck does not start until a place is chosen, and changing place is
+// Stop -> pick -> Start. So the gate is simply shown whenever the DJ is not
+// running; it doubles as the first-run chooser and the "change place" screen.
+// ---------------------------------------------------------------------------
+let placesData = { active: null, places: [] };
+let placesInFlight = false;
+let selectedGenres = [];   // genres picked in the create-place form
+let djAvailable = true;
+
+function labelForPlace(key) {
+  if (!key) return "Any place (all genres)";
+  return key.replace(/_/g, " ").replace(/\b\w/g, (c) => c.toUpperCase());
+}
+
+function genresForPlace(key) {
+  const p = (placesData.places || []).find((x) => x.key === key);
+  return p ? p.genres || [] : [];
+}
+
+// The genre vocabulary is exactly what preference.PLACE_GENRES uses: the union
+// of every place's genres, so a new place can only be built from genres that
+// already exist in PLACE_GENRES.
+function genreCatalog() {
+  const set = new Set();
+  for (const p of placesData.places || []) {
+    for (const g of p.genres || []) set.add(g);
+  }
+  return [...set].sort((a, b) => a.localeCompare(b));
+}
+
+function buildGatePlaces() {
+  const wrap = $("gate-places");
+  if (!wrap) return;
+  const places = placesData.places || [];
+  wrap.innerHTML = places.map((p) =>
+    `<button type="button" class="gate-place${p.custom ? " gp-custom" : ""}"` +
+    ` data-place="${p.key}">` +
+    `<span class="gp-name">${labelForPlace(p.key)}</span>` +
+    `<span class="gp-genres">${(p.genres || []).join(", ")}</span></button>`
+  ).join("") || `<p class="place-hint">No places available.</p>`;
+  setGateBusy(false);
+}
+
+function buildGenreChips() {
+  const avail = $("gate-genres");
+  const sel = $("gate-selected");
+  if (!avail || !sel) return;
+  avail.innerHTML = genreCatalog()
+    .filter((g) => !selectedGenres.includes(g))
+    .map((g) => `<button type="button" class="chip" data-genre="${g}">${g}</button>`)
+    .join("");
+  sel.innerHTML = selectedGenres
+    .map((g) => `<button type="button" class="chip" data-genre="${g}">${g}</button>`)
+    .join("");
+}
+
+function toggleGenre(genre) {
+  const i = selectedGenres.indexOf(genre);
+  if (i === -1) selectedGenres.push(genre);
+  else selectedGenres.splice(i, 1);
+  buildGenreChips();
+}
+
+function openGate() {
+  const gate = $("place-gate");
+  if (!gate || !gate.hidden) return;
+  gate.hidden = false;
+  document.body.classList.add("gated");
+  if (!djAvailable) {
+    $("gate-msg").textContent = "DJ playback is unavailable (server started with --no-dj).";
+  }
+  buildGatePlaces();
+  buildGenreChips();
+}
+
+function closeGate() {
+  const gate = $("place-gate");
+  if (!gate || gate.hidden) return;
+  gate.hidden = true;
+  document.body.classList.remove("gated");
+}
+
+function setGateBusy(busy) {
+  const gate = $("place-gate");
+  if (!gate) return;
+  for (const el of gate.querySelectorAll("button")) {
+    el.disabled = busy || !djAvailable;
+  }
+}
+
+function renderPlaceCard() {
+  const key = placesData.active;
+  $("place-current-name").textContent = key ? labelForPlace(key) : "\u2014";
+  $("place-current-genres").textContent = key ? genresForPlace(key).join(", ") : "";
+}
+
+async function refreshPlaces() {
+  if (placesInFlight) return;
+  placesInFlight = true;
+  try {
+    const data = await getJSON(PLACES_URL);
+    placesData = { active: data.active, places: data.places || [] };
+    buildGatePlaces();
+    buildGenreChips();
+    renderPlaceCard();
+  } catch (e) {
+    console.warn("places fetch failed:", e);
+  } finally {
+    placesInFlight = false;
+  }
+}
+
+async function gateStart(key) {
+  $("gate-msg").textContent = `starting ${labelForPlace(key)}...`;
+  setGateBusy(true);
+  try {
+    const res = await post(PLACE_URL, { place: key });
+    placesData.active = res.place;
+    selectedGenres = [];
+    $("gate-name").value = "";
+    flash(`\u25B6 ${labelForPlace(res.place)}`);
+    closeGate();
+    renderPlaceCard();
+    refreshStatusSoon();
+  } catch (e) {
+    $("gate-msg").textContent = `could not start: ${e.message}`;
+    await refreshPlaces();
+  } finally {
+    setGateBusy(false);
+  }
+}
+
+async function gateCreate() {
+  const name = $("gate-name").value.trim();
+  if (!name) { $("gate-msg").textContent = "give the place a name"; return; }
+  if (!selectedGenres.length) { $("gate-msg").textContent = "pick at least one genre"; return; }
+  $("gate-msg").textContent = `creating '${name}'...`;
+  setGateBusy(true);
+  try {
+    const res = await post(PLACE_URL, { place: name, genres: selectedGenres });
+    placesData.active = res.place;
+    $("gate-name").value = "";
+    selectedGenres = [];
+    flash(`created ${labelForPlace(res.place)}`);
+    await refreshPlaces();
+    closeGate();
+    renderPlaceCard();
+    refreshStatusSoon();
+  } catch (e) {
+    $("gate-msg").textContent = `create failed: ${e.message}`;
+  } finally {
+    setGateBusy(false);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Controls
+// ---------------------------------------------------------------------------
 // Actions that move where the DJ is playing: the <audio> element buffers
 // ahead of the live edge, so without reconnecting the browser would keep
 // playing the song we just skipped away from. Reconnect snaps it to "now".
+// skip / previous / restart also reconnect FRESH (no tail seed) so the next
+// song starts cleanly instead of replaying the outgoing song's last moments.
 const RECONNECT = new Set(["skip", "previous", "restart", "seek-forward", "seek-backward"]);
+const FRESH = new Set(["skip", "previous", "restart"]);
 
 async function act(action) {
+  if (action === "pause") {
+    const willPause = !$("pause-btn").classList.contains("paused");
+    pausePending++;
+    setPauseButton(willPause);
+    setDeviceStatus(audioOn && !willPause);
+  }
   flash(`\u2192 ${action}...`);
   try {
     const res = await post(`${CONTROL_URL}/${action}`);
-    if (action === "previous" && res.replayed === false) {
+    if (action === "pause") {
+      if (res.paused) {
+        if (audioOn) audio.pause();
+        flash("\u23F8 paused");
+      } else {
+        reconnectAudio({ fresh: true });
+        flash("\u25B6 resumed");
+      }
+    } else if (action === "previous" && res.replayed === false) {
       flash("no previous song yet");
+    } else if (action === "stop") {
+      if (audioOn) { audio.pause(); audioOn = false; }
+      flash("\u25A0 stopped \u2014 pick a place to start again");
     } else {
       flash(`\u2713 ${res.action || action} sent`);
     }
     if (RECONNECT.has(action)) {
-      reconnectAudio();
+      reconnectAudio({ fresh: FRESH.has(action) });
     }
-    refreshStatus();
+    refreshStatusSoon();
   } catch (e) {
     flash(`control failed: ${e.message}`);
+    refreshStatus();
+  } finally {
+    if (action === "pause") pausePending = Math.max(0, pausePending - 1);
   }
 }
 
 async function rate(rating) {
   flash(rating === 0 ? "\u2192 like..." : "\u2192 dislike...");
+  // Paint the pressed state immediately; the poll corrects it if the rate failed.
+  $("rate-like").classList.toggle("active", rating === 0);
+  $("rate-dislike").classList.toggle("active", rating === 1);
   try {
-    const res = await post(`${CONTROL_URL}/rate`, { rating });
+    await post(`${CONTROL_URL}/rate`, { rating });
     flash(`\u2713 rated ${rating === 0 ? "like" : "dislike"}`);
+    refreshStatusSoon();
   } catch (e) {
     flash(`rate failed: ${e.message}`);
-  }
-}
-
-async function trainPlace(place) {
-  $("models-msg").textContent = `training '${place}'...`;
-  try {
-    const res = await post(`/api/models/train/${place}`);
-    $("models-msg").textContent = `'${res.place}' trained.`;
-    refreshModels();
-  } catch (e) {
-    $("models-msg").textContent = `training failed: ${e.message}`;
-  }
-}
-
-async function trainAll() {
-  $("models-msg").textContent = "training ready places...";
-  try {
-    await post("/api/models/train-all");
-    $("models-msg").textContent = "training pass finished.";
-    refreshModels();
-  } catch (e) {
-    $("models-msg").textContent = `training failed: ${e.message}`;
+    refreshStatus();
   }
 }
 
@@ -187,39 +625,37 @@ function flash(msg) {
   flash._t = setTimeout(() => ($("control-msg").textContent = ""), 3000);
 }
 
-async function refreshStatus() {
-  try {
-    const s = await getJSON(STATUS_URL);
-    renderStatus(s);
-  } catch (e) {
-    $("state-label").textContent = "offline";
-    console.warn("status poll failed:", e);
-  }
-}
-
-async function refreshModels() {
-  try {
-    renderModels(await getJSON(MODELS_URL));
-  } catch (e) {
-    console.warn("models poll failed:", e);
-  }
-}
-
 function wire() {
   document.addEventListener("click", (e) => {
     const actionBtn = e.target.closest("[data-action]");
     if (actionBtn) { act(actionBtn.dataset.action); return; }
-    const trainBtn = e.target.closest("[data-train]");
-    if (trainBtn) { trainPlace(trainBtn.dataset.train); return; }
     if (e.target.id === "rate-like") { rate(0); return; }
     if (e.target.id === "rate-dislike") { rate(1); return; }
-    if (e.target.id === "train-all") { trainAll(); return; }
+    if (e.target.id === "gate-create-btn") { gateCreate(); return; }
+    const placeBtn = e.target.closest(".gate-place");
+    if (placeBtn) { gateStart(placeBtn.dataset.place); return; }
+    const chip = e.target.closest(".chip");
+    if (chip) { toggleGenre(chip.dataset.genre); return; }
     if (e.target.id === "sound-cta") { startAudio(); return; }
   });
 }
 
 wire();
+bindAudioWatchdog();
 refreshStatus();
-refreshModels();
-setInterval(refreshStatus, 1500);
-setInterval(refreshModels, 5000);
+refreshPlaces();
+setInterval(refreshStatus, 500);
+setInterval(paintProgress, 100);
+setInterval(() => {
+  // Final backstop: if the DJ status says "playing" but the <audio> element
+  // has silently stopped advancing, snap it back to the live edge. Catches the
+  // cases that fire no event (backgrounded tabs, wedged connections).
+  // A genuinely stalled element (readyState stuck below HAVE_FUTURE_DATA while
+  // still marked as buffering) counts the same way, even if the element didn't
+  // pause itself — no amount of waiting fixes "no data flowing".
+  if (!audioOn || !lastStatus || !lastStatus.playing || lastStatus.paused) return;
+  const stuck = audio.paused
+    ? (audio.readyState <= 2 && audio.currentTime > 0)
+    : (audioBuffering && audio.readyState <= 2);
+  if (stuck) reconnectAudio();
+}, 2000);

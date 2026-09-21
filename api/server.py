@@ -1,35 +1,21 @@
-"""DJ Agent web UI — run the DJ in the background and serve the control UI.
+"""DJ Agent web UI — serve the control UI and start the DJ once a place is
+chosen in the browser.
 
     python api/server.py                     # DJ + UI on http://127.0.0.1:8000
-    python api/server.py --resume-place car  # run only that place's model
+    python api/server.py --resume-place car  # auto-start on that place (skip gate)
     python api/server.py --no-dj             # API + UI only (control returns 503)
 
-Flags mirror Music/dj.py so the playback behaviour is identical to the CLI.
+The DJ does not start at boot: the UI shows a place gate and POST
+/api/control/place starts the deck with the chosen place. Pass --resume-place
+to skip the gate and start immediately (handy for scripted/CLI use).
 """
 
 import argparse
 import os
 import sys
-import threading
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, PROJECT_ROOT)
-
-
-def _boot_dj(dj, sink=None):
-    """Mirror Music/dj.py __main__: resume saved unplayed tracks when present,
-    otherwise hand the deck to the batch pipeline. Blocks until a first song
-    is available, hence the background thread."""
-    try:
-        with dj._saved_lock:
-            saved_count = len(dj._saved_set)
-        first_song = dj.get_next_song() if saved_count else None
-        # keyboard=False: all control happens through the web UI, not the
-        # terminal — no msvcrt/termios listener is started. sink != None sends
-        # the audio to the browser instead of the machine speaker.
-        dj.start(first_song, dj.get_next_song, keyboard=False, sink=sink)
-    except Exception as e:
-        print("DJ boot failed:", e)
 
 
 def main():
@@ -62,26 +48,30 @@ def main():
 
     from api import state
 
-    if not args.no_dj:
-        from Music.dj import DJ
-        from Music.streamsink import StreamSink
+    state.allow_dj = not args.no_dj
+    state.pool_size = args.pool_size
+    state.top_n = args.top_n
+    state.speaker = args.speaker
 
-        dj = DJ(pool_size=args.pool_size, top_n=args.top_n,
-                resume_unplayed=args.resume_unplayed,
-                resume_place=args.resume_place)
-        state.dj = dj
+    if args.no_dj:
+        print("API-only mode (--no-dj) — playback controls return 503.")
+    elif args.resume_place:
+        # Explicit command-line place: skip the gate and start straight away.
+        from api import session
+
+        print(f"Auto-starting DJ on place '{args.resume_place}' (skipping the UI gate)...")
+        try:
+            session.start(args.resume_place)
+        except RuntimeError as exc:
+            print("DJ start failed:", exc)
+    else:
+        print("Waiting for a place to be chosen in the UI before starting the DJ.")
+
+    if not args.no_dj:
         if args.speaker:
-            sink = None
             print("Audio output: machine speakers (--speaker).")
         else:
-            sink = StreamSink()
-            state.sink = sink
             print("Audio output: web browser stream (use --speaker for machine sound).")
-        role = f"place='{args.resume_place}'" if args.resume_place else "all places"
-        print(f"Starting DJ in the background ({role})...")
-        threading.Thread(target=_boot_dj, args=(dj, sink), daemon=True).start()
-    else:
-        print("API-only mode (--no-dj) — playback controls return 503.")
 
     import uvicorn
 

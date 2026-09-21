@@ -12,7 +12,7 @@ from sklearn.utils.validation import check_is_fitted
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
-MIN_SAMPLES = 50
+MIN_SAMPLES = 10
 RETRAIN_AFTER = 15
 TARGET = 'likeability'
 WEIGHT = 'confidence'
@@ -102,7 +102,7 @@ def ensure_place_model(place):
     fall back to random selection).
 
       * place is None        -> train the legacy global model over all Songs.
-      * < MIN_SAMPLES (50)   -> no model yet, wait for more records.
+      * < MIN_SAMPLES         -> no model yet, wait for more records.
       * pickle saved and
         fewer than RETRAIN_AFTER (15) new records since it was trained
                              -> load the pickle (fast, no re-fit).

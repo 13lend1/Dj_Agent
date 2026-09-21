@@ -1,8 +1,13 @@
 """FastAPI app for the DJ web UI.
 
     GET  /api/control/status   now-playing snapshot
-    POST /api/control/{skip,replay,restart,seek-forward,seek-backward,stop}
+    POST /api/control/{skip,previous,restart,seek-forward,seek-backward,stop}
+    POST /api/control/{pause,resume}
     POST /api/control/rate     {"rating": 0|1}
+    GET  /api/control/places   selectable places + the active one
+    POST /api/control/place    choose a place (starts the DJ) or create one
+                               {"place": name, "genres": [...]}  (genres = create)
+                               returns 409 while the DJ runs — Stop first
     GET  /api/models            per-place model train/retrain state
     POST /api/models/train/{place}
     POST /api/models/train-all

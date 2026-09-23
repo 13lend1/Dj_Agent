@@ -431,16 +431,25 @@ def skip():
     return {"ok": True, "action": "skip"}
 
 
+@router.post("/full")
+def full():
+    """Play the current song to its full length: keep the play position but
+    drop the hook end-cap so it runs to the track's real end. Counts as a strong
+    like signal (like replay: score +350, confidence 1.0) when scored."""
+    dj = _dj()
+    dj.play_whole()
+    return {"ok": True, "action": "full"}
+
+
 @router.post("/previous")
 def previous():
-    """Listen to the previous song again. A deliberate listen-back counts as a
-    replay (strong like signal) in the playback loop."""
+    """Step back one song through the place's play history. A replayed song
+    counts as a deliberate listen-back (score +350, confidence 1.0) when scored.
+    replayed=False means there was nothing earlier to step back to."""
     dj = _dj()
-    with dj.lock:
-        has_previous = dj.last_song is not None
-    if not has_previous:
+    if not dj.can_play_previous():
         return {"ok": True, "action": "previous", "replayed": False}
-    dj.replay()
+    dj.play_previous()
     return {"ok": True, "action": "previous", "replayed": True}
 
 

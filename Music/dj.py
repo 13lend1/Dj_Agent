@@ -64,13 +64,15 @@ class DJ(PreloadedPlayer):
     """
 
     def __init__(self, pool_size=50, top_n=15, clip_length=33, resume_unplayed=None, resume_place=None, trial=False):
-        # TRIAL FAST-START: a place with nothing preprocessed yet plays its
-        # first ~10 fetched songs RAW (bypassing the model + Agent ordering) to
-        # get audio going as fast as possible; the normal model-scored, agent-
-        # ordered pipeline takes over once the trial budget is spent. Must be
-        # set before super().__init__() spawns the worker threads.
+        # TRIAL FAST-START: a place with nothing preprocessed yet used to play
+        # its first ~10 fetched songs RAW (bypassing the model + Agent ordering)
+        # to get audio going as fast as possible. The base-class first batch now
+        # covers that: it pulls a small batch (~3 songs) as soon as they exist
+        # and runs it through the regular model-scored, agent-ordered pipeline.
+        # The trial budget is therefore always 0, so no raw path ever runs.
+        # Must be set before super().__init__() spawns the worker threads.
         self._trial = trial
-        self._trial_budget = 10 if trial else 0
+        self._trial_budget = 0
         # Resume set state MUST exist and be loaded before super().__init__()
         # starts the background worker threads: otherwise the batch worker
         # could build a fresh run and overwrite the newest saved run (and its
@@ -107,8 +109,13 @@ class DJ(PreloadedPlayer):
         self._saved_lock = threading.Lock()
         self.arm_saved_set()
 
-        super().__init__(pool_size=pool_size, top_n=top_n)
+        # The Agent must exist BEFORE super().__init__() spawns the batch
+        # worker threads: the first _fetch_batch(small=True) fires the moment
+        # the pool reaches ~first_batch_n songs and can otherwise race ahead of
+        # self.agent (an AttributeError retried away). Agent() only builds the
+        # genai client — no network happens here.
         self.agent = Agent()
+        super().__init__(pool_size=pool_size, top_n=top_n)
         self.clip_length = clip_length
         self.current_clip_duration = None
         self._advance_fail_count = 0
@@ -122,6 +129,10 @@ class DJ(PreloadedPlayer):
         self._last_transition_pair = None
         self._last_transition_at = 0.0
         self._stall_started = None
+        # Set when the user asked to play the CURRENT song to its full length
+        # (whole-play). _score_current_song turns it into the strong like signal
+        # (replayed=1 -> score +350, confidence 1.0) for that song.
+        self._whole_played = False
         # Local audio cache: yt-dlp downloads each track to disk (keyed by its
         # page URL) and ffmpeg decodes the file, so music requests never leave
         # ffmpeg -> no googlevideo 403 and no mid-stream session kills.
@@ -197,8 +208,15 @@ class DJ(PreloadedPlayer):
             cls._effect_cache[name] = samples
             return samples
 
-    def _fetch_batch(self):
-        fresh = take_preprocessed_batch(n=self.pool_size, place=getattr(self, 'place', None))
+    def _fetch_batch(self, n=None, small=False):
+        fresh = take_preprocessed_batch(
+            n=(n or self.pool_size), place=getattr(self, 'place', None))
+
+        # The small first batch already ran the agent fast-start, so the raw
+        # trial path is no longer needed.
+        if small and getattr(self, '_trial', False):
+            self._trial = False
+            self._trial_budget = 0
 
         candidates = []
         if fresh:
@@ -216,8 +234,9 @@ class DJ(PreloadedPlayer):
 
         # Nonstop guarantee: once the pool of unplayed songs is exhausted,
         # recycle already-played songs so the DJ keeps playing forever instead
-        # of running dry (the catalog is finite, the set must not be).
-        if len(candidates) < self.top_n:
+        # of running dry (the catalog is finite, the set must not be). Skipped
+        # for the small first batch so it stays small and agent-scoped.
+        if not small and len(candidates) < self.top_n:
             try:
                 recycled = recycle_played_songs(
                     n=self.pool_size, place=getattr(self, 'place', None))
@@ -227,21 +246,17 @@ class DJ(PreloadedPlayer):
             seen = {c.get('id') for c in candidates}
             recycled = [r for r in recycled if r.get('id') not in seen]
             if recycled:
-                print(f"Recycling {len(recycled)} already-played song(s) to keep "
+                print(f"Recycling {len(recycled)} scored song(s) to keep "
                       "the set running (pool of new songs is low).")
                 candidates += recycled
 
         if not candidates:
             return
 
-        # TRIAL FAST-START: on a cold place (nothing preprocessed yet) the
-        # first ~10 fetched songs are played as fast as possible — skipping the
-        # model and the Gemini/Agent ordering. They still play their hook window
-        # (like any normal song), but the window is the deterministic clip
-        # fallback, which costs zero latency, so the first track can start
-        # downloading the moment it is discovered. Once the budget runs out the
-        # DJ switches to the normal model-scored, Gemini-ordered pipeline.
-        if getattr(self, '_trial', False):
+        # TRIAL FAST-START: kept only for backward-compat messaging — the budget
+        # is always 0 now (the base-class small first batch replaced it), so it
+        # self-disables on the first call without queuing anything raw.
+        if getattr(self, '_trial', False) and not small:
             take = min(min(self.top_n, self._trial_budget), len(candidates))
             self._trial_budget -= take
             if self._trial_budget <= 0:
@@ -293,6 +308,33 @@ class DJ(PreloadedPlayer):
         except Exception as e:
             print("Scoring unavailable, selecting randomly instead:", e)
             records = random.sample(candidates, min(self.top_n, len(candidates)))
+
+        # FAST FIRST BATCH: the first songs must start NOW. Routing the small
+        # first batch through the Agent's Gemini calls left the deck on STANDBY
+        # for minutes (a 503/"overloaded" model retries 5x20s, then the hook
+        # repair adds another 3x15s) before a single song was queued. Queue the
+        # small first batch with deterministic middle-section hooks instead; the
+        # normal agent-ordering pipeline takes over from the second batch on.
+        if small:
+            clip_length = float(getattr(self, 'clip_length', 33) or 33.0)
+            for song in records:
+                start, end = self.agent._clip_window(song, clip_length)
+                song["play_start_sec"] = start
+                song["play_end_sec"] = end
+                song["play_start"] = Agent._fmt(start)
+                song["play_end"] = Agent._fmt(end)
+                song["clip_length"] = round(max(0.0, end - start), 1)
+                song["hook_length"] = round(max(0.0, end - start), 1)
+                song["transition_out"] = None
+            with self.batch_lock:
+                self.batch.extend(records)
+            if records:
+                first = records[0]
+                print(f"Fast-started {len(records)} song(s) with fallback hooks "
+                      f"({first['name']} {self._fmt_hook(first)})", flush=True)
+            else:
+                print("Fast-start queued no songs.", flush=True)
+            return
 
         # The Agent orders the n-best and picks the timestamps to play.
         # Use the actual next-to-play song (batch tail) as the predecessor
@@ -531,7 +573,7 @@ class DJ(PreloadedPlayer):
     def _download_media(self, url, options):
         """Download the best audio track to a local file using yt-dlp's own
         (impersonated, cookie-bearing) HTTP stack, caching it by page URL so
-        seeks, restarts and replays never refetch. Returns the local path."""
+        seeks, restarts and whole-plays never refetch. Returns the local path."""
         with self._media_lock:
             cached = self._media_files.get(url)
             if cached and os.path.isfile(cached):
@@ -759,6 +801,8 @@ class DJ(PreloadedPlayer):
         self._play_gain = 1.0
         self._transition_scored = False
         self._stall_started = None
+        self._whole_played = False
+        self._replayed_now = False
         self.agent.track(song)
     @staticmethod
     def _transition_secs(crossfade_sec):
@@ -830,7 +874,7 @@ class DJ(PreloadedPlayer):
         song['liked'] = liked
         song['skipp'] = skipp
         song['end_reason'] = end_reason
-        song['replayed'] = 0
+        song['replayed'] = 1 if (self._whole_played or self._replayed_now) else 0
         self.save_queue.put(song)
 
     def _crossfade(self, out_process, in_process, stream, secs, effect=None):
@@ -909,7 +953,7 @@ class DJ(PreloadedPlayer):
         # main-loop stall watchdog handle a truly dead incoming stream.
         crossfade_deadline = time.time() + max(secs * 3.0, 30.0)
         a_real_eof = b_real_eof = False
-        while not self.stop_event.is_set():
+        while (not self.stop_event.is_set() and not self.pause_event.is_set()):
             if time.time() > crossfade_deadline:
                 break
             t1 = 1.0 if fade_bytes <= 0 else min(written / fade_bytes, 1.0)
@@ -1022,7 +1066,7 @@ class DJ(PreloadedPlayer):
         song plays at full level underneath while the effect is mixed on top
         (short fade-in, tail fade-out). Consumes about len(effect) of the
         incoming stream, so the main loop simply carries on where this stops."""
-        if effect is None or not len(effect):
+        if effect is None or not len(effect) or self.pause_event.is_set():
             return
         eff_len = len(effect)
         eff_i = 0
@@ -1030,7 +1074,8 @@ class DJ(PreloadedPlayer):
         fade_in_frames = int(0.05 * 44100)
         fade_out_frames = int(0.2 * 44100)
         carry = b""
-        while not self.stop_event.is_set() and eff_i < eff_len:
+        while (not self.stop_event.is_set() and not self.pause_event.is_set()
+               and eff_i < eff_len):
             try:
                 chunk = self._read_chunk(in_process, timeout=1.0)
             except (OSError, ValueError):
@@ -1102,6 +1147,7 @@ class DJ(PreloadedPlayer):
             # still elapses — while the UI now switches instantly.
             self._begin_song(next_song, next_process)
             self.last_song = outgoing
+            self._record_live_song(next_song)
             self._transitioning = True
             try:
                 matched_gain = self._crossfade(current, next_process, stream, crossfade_sec, effect=effect_samples)
@@ -1121,6 +1167,7 @@ class DJ(PreloadedPlayer):
                 pass
             self._begin_song(next_song, next_process)
             self.last_song = outgoing
+            self._record_live_song(next_song)
             effect_samples = self._load_effect(effect)
             if effect_samples is not None and len(effect_samples):
                 self._play_effect_intro(next_process, stream, effect_samples)
@@ -1130,6 +1177,10 @@ class DJ(PreloadedPlayer):
     def play(self, first_song, get_next_song, sink=None):
 
         self._sink = sink
+
+        # Fresh play-history for this place session: play_previous() steps back
+        # through the songs the deck actually plays from here on.
+        self._reset_session()
 
         # A browser sink replaces the machine audio device: the same PCM
         # continues flowing to the UI's <audio> element instead of the speaker.
@@ -1162,6 +1213,7 @@ class DJ(PreloadedPlayer):
             current = self.prepare_song(first_song)
             self._begin_song(first_song, current)
             self._holding = False
+            self._record_live_song(first_song)
             print(f"Now playing: {self.current_title} {self._fmt_hook(first_song)}",
                   flush=True)
             self._keep_preloaded(get_next_song)
@@ -1169,7 +1221,7 @@ class DJ(PreloadedPlayer):
             print("\nDJ started!")
             print("n = next")
             print("s = stop")
-            print("r = replay the song that played before this one")
+            print("r = previous song (steps back through this place's history)")
             print("a = restart current song from the beginning")
             print("<- / -> = seek back / forward 5 seconds")
             print("Ctrl+C = stop\n")
@@ -1179,6 +1231,7 @@ class DJ(PreloadedPlayer):
                 if self.restart_event.is_set():
 
                     self.restart_event.clear()
+                    self.skip_event.clear()
 
                     with self.lock:
                         song = dict(self.current_song)
@@ -1197,32 +1250,80 @@ class DJ(PreloadedPlayer):
                           flush=True)
                     continue
 
-                if self.replay_event.is_set():
+                if self.whole_event.is_set():
 
-                    self.replay_event.clear()
+                    self.whole_event.clear()
+                    self.skip_event.clear()
 
                     with self.lock:
-                        outgoing = dict(self.current_song) if self.current_song is not None else None
-                        replay_song = dict(self.last_song) if self.last_song else None
+                        song = dict(self.current_song)
 
-                    if replay_song is None:
-                        print("\nNo previous song to replay.")
+                    if song is None:
+                        print("\nNo song to play in full.")
                         continue
-
-                    self._score_replay(replay_song)
 
                     try:
                         current.kill()
                     except Exception:
                         pass
 
-                    current = self.prepare_song(replay_song)
-                    self._begin_song(replay_song, current)
+                    elapsed = self.elapsed_now() or 0.0
+                    start = float(song.get('play_start_sec') or 0) + max(0.0, elapsed)
+                    # Drop the hook end-cap so the track streams to its true end
+                    # (play_end_sec=None -> current_clip_duration=None -> no early
+                    # advance; the track runs to its real end).
+                    song['play_start_sec'] = None
+                    song['play_end_sec'] = None
+                    song['transition_out'] = None
+                    current = self.prepare_song(song, seek_to=start)
+                    self._begin_song(song, current, start_offset=max(0.0, elapsed))
                     self._holding = False
-                    self.last_song = outgoing
+                    # _begin_song resets _whole_played for every new song, and this
+                    # IS the whole-play: flag it AFTER so the score becomes the
+                    # strong like signal (replayed=1 -> +350, confidence 1.0).
+                    self._whole_played = True
 
-                    print(f"\nNow playing (replayed): {self.current_title} {self._fmt_hook(replay_song)}",
-                          flush=True)
+                    print(f"\nPlaying in full: {self.current_title}", flush=True)
+                    continue
+
+                if self.previous_event.is_set():
+
+                    self.previous_event.clear()
+                    self.skip_event.clear()
+
+                    with self.lock:
+                        outgoing = dict(self.current_song) if self.current_song is not None else None
+
+                    prev_song = self._resolve_previous()
+
+                    if prev_song is None:
+                        print("\nNo earlier songs in this place's history.", flush=True)
+                        continue
+
+                    # A previous cut is the mirror of a skip: instant stop, then
+                    # the outgoing song's transition drops over the replayed
+                    # song's intro, so moving left feels like moving right.
+                    transitions = (outgoing or {}).get('transition_out') or self.DEFAULT_TRANSITION
+                    effect = transitions.get('effect')
+
+                    try:
+                        current.kill()
+                    except Exception:
+                        pass
+
+                    current = self.prepare_song(prev_song)
+                    self._begin_song(prev_song, current)
+                    self._holding = False
+
+                    # Step-back counts as a deliberate listen-back: flag AFTER
+                    # _begin_song so the score carries replayed=1.
+                    self._replayed_now = True
+
+                    effect_samples = self._load_effect(effect)
+                    if effect_samples is not None and len(effect_samples):
+                        self._play_effect_intro(current, stream, effect_samples)
+
+                    print(f"\nNow playing (replayed from history): {self.current_title}", flush=True)
                     continue
 
                 if self.seek_forward_event.is_set() or self.seek_backward_event.is_set():
@@ -1230,6 +1331,7 @@ class DJ(PreloadedPlayer):
                     seek_fwd = self.seek_forward_event.is_set()
                     self.seek_forward_event.clear()
                     self.seek_backward_event.clear()
+                    self.skip_event.clear()
 
                     with self.lock:
                         song = dict(self.current_song)
@@ -1256,12 +1358,8 @@ class DJ(PreloadedPlayer):
                         target = max(0.0, target)
                     else:
                         if elapsed <= 0.5:
-                            if self.last_song is not None:
-                                print("\nAt start of song — going to previous...")
-                                self.replay()
-                            else:
-                                print("\nAt start of song — restarting...")
-                                self.restart()
+                            print("\nAt start of song — restarting...")
+                            self.restart()
                             continue
                         target = max(0.0, target)
 
@@ -1313,18 +1411,40 @@ class DJ(PreloadedPlayer):
                             self._transition_scored = True
                             self._score_current_song(end_reason='skipped')
 
-                        next_song = self._safe_advance(current, stream, 0.0)
-
-                        if next_song is not None:
-                            current = next_song['process']
-                            self._transition_scored = False
-                            self._dry_started = None
-                            self._advance_fail_count = 0
-                            self._hold_wait_since = None
+                        # Stepped back into history? Skip moves FORWARD within the
+                        # window (B -> C), not on to a new live song (D).
+                        window_next = self._resolve_forward()
+                        if window_next is not None:
+                            try:
+                                current.kill()
+                            except Exception:
+                                pass
+                            current = self.prepare_song(window_next)
+                            self._begin_song(window_next, current)
                             self._holding = False
-                            print(f"Paused — queued next song: "
-                                  f"{self.current_title} {self._fmt_hook(next_song)}",
+                            self._transition_scored = False
+                            self._replayed_now = True
+                            print(f"Paused — queued history song: "
+                                  f"{self.current_title} {self._fmt_hook(window_next)}",
                                   flush=True)
+                        else:
+                            next_song = self._safe_advance(current, stream, 0.0)
+
+                            if next_song is not None:
+                                current = next_song['process']
+                                self._transition_scored = False
+                                self._dry_started = None
+                                self._advance_fail_count = 0
+                                self._hold_wait_since = None
+                                self._holding = False
+                                print(f"Paused — queued next song: "
+                                      f"{self.current_title} {self._fmt_hook(next_song)}",
+                                      flush=True)
+                            else:
+                                # No decoded song yet (mid-first-song). Keep the skip
+                                # armed so the deck cuts to it the moment the preload
+                                # lands instead of silently dropping the request.
+                                self.skip_event.set()
 
                     # Keep the preload buffer warm across the pause so resume is
                     # instant (cheap no-op when a preload is already in flight).
@@ -1357,41 +1477,71 @@ class DJ(PreloadedPlayer):
                         self._transition_scored = True
                         self._score_current_song(end_reason='skipped')
 
-                    if not self.replay_event.is_set():
-                        if transitions.get('type') != 'cut':
-                            print(f"Crossfading out: {transitions.get('note', '')}")
+                    # Stepped back into history? Skip moves FORWARD within the
+                    # window (B -> C), not on to a new live song (D).
+                    window_next = self._resolve_forward()
+                    if window_next is not None:
+                        try:
+                            current.kill()
+                        except Exception:
+                            pass
+                        current = self.prepare_song(window_next)
+                        self._begin_song(window_next, current)
+                        self._holding = False
+                        self._transition_scored = False
+                        self._dry_started = None
+                        self._advance_fail_count = 0
+                        self._replayed_now = True
+                        effect_samples = self._load_effect(effect)
+                        if effect_samples is not None and len(effect_samples):
+                            self._play_effect_intro(current, stream, effect_samples)
+                        print(f"Starting next song: {self.current_title} "
+                              f"{self._fmt_hook(window_next)}", flush=True)
+                        self._keep_preloaded(get_next_song)
+                        continue
 
-                    # A skip is a hard cut, not a blend: the playing song stops
-                    # immediately and the transition effect (if any) plays over
-                    # the start of the next one.
-                    next_song = self._safe_advance(current, stream, 0.0, effect=effect)
+                    # A skip is an INSTANT cut: the current song stops immediately,
+                    # the transition effect drops over the start of the next one,
+                    # and the UI's audio bar switches to the new song right away
+                    # (current_song is reassigned by _safe_advance, which is what
+                    # /api/state reports and the bar renders).
+                    #
+                    # No decoded next song yet (typical for the very FIRST song,
+                    # whose second track is still downloading). Do NOT block the
+                    # loop: keep the current song's audio rolling, re-arm the
+                    # skip so it cuts the moment a preload lands — a mid-song
+                    # skip must never be dropped silently. The dry guard just
+                    # logs; the skip keeps trying every loop pass.
+                    if self.song_queue.empty():
 
-                    if next_song is None:
-                        # No preloaded song yet (slow preload / batch still
-                        # warming up). Never shut the DJ down for that — keep
-                        # the current song rolling and let the normal advance
-                        # path grab the song the moment it lands.
                         if self._dry_started is None:
                             self._dry_started = time.time()
                             print("Skipping — waiting for the next song to "
                                   "preload...", flush=True)
                         elif time.time() - self._dry_started >= self.POOL_DRY_TIMEOUT:
-                            # A dry pool must NEVER stop the DJ: keep the current
-                            # song rolling and keep retrying the pipeline.
                             print("Pool is dry — keeping the current song rolling "
                                   "while the pipeline refills.", flush=True)
                             self._dry_started = time.time()
+                        self.skip_event.set()
                         self._keep_preloaded(get_next_song)
                     else:
-                        current = next_song['process']
-                        self._advance_fail_count = 0
-                        self._dry_started = None
-                        self._hold_wait_since = None
-                        self._holding = False
-                        self._transition_scored = False
-                        print(f"Starting next song: {self.current_title} {self._fmt_hook(next_song)}")
-                        self._keep_preloaded(get_next_song)
-                        continue
+                        next_song = self._safe_advance(
+                            current, stream, 0.0, effect=effect)
+
+                        if next_song is None:
+                            self.skip_event.set()
+                            self._keep_preloaded(get_next_song)
+                        else:
+                            current = next_song['process']
+                            self._advance_fail_count = 0
+                            self._dry_started = None
+                            self._hold_wait_since = None
+                            self._holding = False
+                            self._transition_scored = False
+                            print(f"Starting next song: {self.current_title} "
+                                  f"{self._fmt_hook(next_song)}", flush=True)
+                            self._keep_preloaded(get_next_song)
+                            continue
 
                 # As the hook window runs out, begin the suggested crossfade
                 elapsed = time.time() - self.current_start_time
@@ -1410,11 +1560,28 @@ class DJ(PreloadedPlayer):
                                 self.current_elapsed = elapsed
                             song_for_played = dict(self.current_song) if self.current_song is not None else None
                             self._score_current_song(end_reason='finished')
-                            if not self.replay_event.is_set():
-                                if transitions.get('type') != 'cut':
-                                    print(f"\nCrossfading to next: {transitions.get('note', '')}")
+                            if transitions.get('type') != 'cut':
+                                print(f"\nCrossfading to next: {transitions.get('note', '')}")
                             if song_for_played:
                                 self._mark_queue.put(dict(song_for_played))
+
+                    # A replayed history song finished: step forward inside the
+                    # window (B -> C) instead of fetching a new live song.
+                    window_next = self._resolve_forward()
+                    if window_next is not None:
+                        try:
+                            current.kill()
+                        except Exception:
+                            pass
+                        current = self.prepare_song(window_next)
+                        self._begin_song(window_next, current)
+                        self._holding = False
+                        self._transition_scored = False
+                        self._replayed_now = False
+                        print(f"\nNow playing: {self.current_title} {self._fmt_hook(window_next)}",
+                              flush=True)
+                        self._keep_preloaded(get_next_song)
+                        continue
 
                     next_song = self._safe_advance(current, stream, crossfade_sec, effect=effect)
 
@@ -1483,7 +1650,7 @@ class DJ(PreloadedPlayer):
                     # A stream that dies well before its clip window ends isn't a
                     # "finished song" — it's a dead / region-blocked / short wrong
                     # video. Don't flag it as played (so it can drift back and be
-                    # refetched) and don't make it the replay target.
+                    # refetched).
                     clip = self.current_clip_duration
                     with self.lock:
                         early_elapsed = time.time() - self.current_start_time
@@ -1498,6 +1665,24 @@ class DJ(PreloadedPlayer):
                             with self.lock:
                                 self.current_elapsed = time.time() - self.current_start_time
                             self._score_current_song(end_reason='interrupted' if early else 'finished')
+
+                    # A replayed history song finished: step forward inside the
+                    # window (B -> C) instead of fetching a new live song.
+                    window_next = self._resolve_forward()
+                    if window_next is not None:
+                        try:
+                            current.kill()
+                        except Exception:
+                            pass
+                        current = self.prepare_song(window_next)
+                        self._begin_song(window_next, current)
+                        self._holding = False
+                        self._transition_scored = False
+                        self._replayed_now = False
+                        print(f"\nNow playing: {self.current_title} {self._fmt_hook(window_next)}",
+                              flush=True)
+                        self._keep_preloaded(get_next_song)
+                        continue
 
                     fade = crossfade_sec if (crossfade_sec and crossfade_sec > 0) else self.DEFAULT_TRANSITION['crossfade_sec']
                     next_song = self._safe_advance(current, stream, fade, effect=effect)
@@ -1529,7 +1714,11 @@ class DJ(PreloadedPlayer):
                             # Don't hammer the network: one request per HOLD_TIMEOUT.
                             self._hold_wait_since = time.time()
                         self._keep_preloaded(get_next_song)
-                        time.sleep(2.0)
+                        # Poll the preload queue quickly: the 6s silence lead in
+                        # the stream sink keeps the browser fed through the wait,
+                        # so a shorter retry cadence just starts the next song
+                        # sooner once a preload lands.
+                        time.sleep(0.5)
                         continue
 
                     if song_for_played and not early and not self._holding:

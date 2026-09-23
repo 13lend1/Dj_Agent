@@ -1,7 +1,7 @@
 """FastAPI app for the DJ web UI.
 
     GET  /api/control/status   now-playing snapshot
-    POST /api/control/{skip,previous,restart,seek-forward,seek-backward,stop}
+    POST /api/control/{skip,full,restart,seek-forward,seek-backward,stop}
     POST /api/control/{pause,resume}
     POST /api/control/rate     {"rating": 0|1}
     GET  /api/control/places   selectable places + the active one

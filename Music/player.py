@@ -17,20 +17,29 @@ class Player:
         self.save_queue = queue.Queue()
         self.stop_event = threading.Event()
         self.skip_event = threading.Event()
-        self.replay_event = threading.Event()
+        self.whole_event = threading.Event()
+        self.previous_event = threading.Event()
         self.restart_event = threading.Event()
         self.seek_forward_event = threading.Event()
         self.seek_backward_event = threading.Event()
         self.pause_event = threading.Event()
+        self.lock = threading.Lock()
         self._pause_clock = None
         self.last_song = None
+        # Ordered history of songs the deck has played during the current place
+        # session (oldest first); play_previous() steps back through it.
+        self._history = []
+        self._hist_pos = 0
+        self._history_max = 200
+        # Flag for the CURRENT song: the user pressed previous and this song is
+        # now a deliberate listen-back -> replayed=1 (+350, confidence 1.0).
+        self._replayed_now = False
         self.current_song = None
         self.current_length = None
         self.current_elapsed = None
         self.current_process = None
         self.current_url = None
         self.current_rating = None
-        self.lock = threading.Lock()
         self._last_scored_song_id = None
         self._sink = None  # live output stream (StreamSink for the web UI)
 
@@ -74,8 +83,88 @@ class Player:
     def skip(self):
         self.skip_event.set()
 
-    def replay(self):
-        self.replay_event.set()
+    def play_whole(self):
+        """Extend the current track to its full length (keep the play position,
+        drop the hook end cap). Counts as a strong like signal when scored."""
+        self.whole_event.set()
+
+    def play_previous(self):
+        """Step back one song through the place's play history (circular: from
+        the start it wraps to the newest). The replayed song counts as a
+        deliberate listen-back (strong like signal) when it is scored."""
+        if self.can_play_previous():
+            self.previous_event.set()
+
+    def can_play_previous(self):
+        with self.lock:
+            return bool(self._history)
+
+    def _reset_session(self):
+        """Start a fresh play history for the current place/session."""
+        with self.lock:
+            self._history = []
+            self._hist_pos = 0
+        self._replayed_now = False
+
+    def _record_live_song(self, song):
+        """A fresh LIVE song just became the current one: push it onto the
+        history window (sliding the oldest out past the cap) and put the
+        pointer on it. The window ALWAYS contains the song currently playing.
+
+        When the pointer is still inside the window (we stepped back and are
+        moving forward by hand) nothing is pushed — the forward move stays in
+        history instead of fetching a new live song."""
+        if song is None:
+            return
+        with self.lock:
+            if self._hist_pos < len(self._history) - 1:
+                return  # mid-window: the forward move is handled by _resolve_forward
+            self._history.append(dict(song))
+            if len(self._history) > self._history_max:
+                del self._history[:len(self._history) - self._history_max]
+            self._hist_pos = len(self._history) - 1
+
+    def _resolve_previous(self):
+        """Circular step BACK through the history window (C -> B, and A -> C).
+        Returns the song (with the pointer moved) or None when the window is
+        empty."""
+        with self.lock:
+            n = len(self._history)
+            if n == 0:
+                return None
+            target = (self._hist_pos - 1) % n
+            self._hist_pos = target
+            return dict(self._history[target])
+
+    def _resolve_forward(self):
+        """A FORWARD move while the pointer sits inside the history window
+        (we stepped back with previous) steps to the NEXT history entry instead
+        of fetching a new live song — B skipped forwards to C, not to D.
+        Returns the song (with the pointer moved) or None at the live front,
+        where forward means advancing to a new live song."""
+        with self.lock:
+            if self._hist_pos < len(self._history) - 1:
+                target = self._hist_pos + 1
+                self._hist_pos = target
+                return dict(self._history[target])
+        return None
+
+    def _switch_to(self, song, link_key='link'):
+        """Rebuild the current-song fields (+ history pointer) around `song`.
+        Returns the freshly prepared process. Used by history moves (previous
+        and forward-through-history)."""
+        current = self.prepare_song(song[link_key])
+        with self.lock:
+            self.last_song = dict(self.current_song) if self.current_song is not None else None
+            self.current_process = current
+            self.current_url = song[link_key]
+            self.current_song = song
+            self.current_title = song['name']
+            self.current_length = song['duration']
+            self.current_start_time = time.time()
+            self.current_elapsed = None
+            self.current_rating = None
+        return current
 
     def restart(self):
         self.restart_event.set()
@@ -85,7 +174,7 @@ class Player:
         self.seek_forward_event.set()
 
     def seek_backward(self):
-        """Skip 5s back (falls back to the previous song at the start)."""
+        """Skip 5s back (restarts the current song at the start)."""
         self.seek_backward_event.set()
 
     def pause(self):
@@ -179,6 +268,8 @@ class Player:
 
     def play(self, first_song, get_next_song, sink=None):
 
+        self._reset_session()
+
         current_song = first_song
         current = self.prepare_song(current_song['link'])
         with self.lock:
@@ -190,12 +281,14 @@ class Player:
             self.current_start_time = time.time()
             self.current_rating = None
 
+        self._record_live_song(current_song)
+
         print(f"Now playing: {self.current_title}")
 
         print("\nDJ started!")
         print("n = next")
         print("s = stop")
-        print("r = replay the song that played before this one")
+        print("r = previous song (steps back through this place's history)")
         print("a = restart current song from the beginning")
         print("<- / -> = seek back / forward 5 seconds")
         print("Ctrl+C = stop\n")
@@ -230,35 +323,26 @@ class Player:
                         print(f"\nRestarting from the beginning: {song['name']}")
                         continue
 
-                    if self.replay_event.is_set():
+                    if self.previous_event.is_set():
 
-                        self.replay_event.clear()
+                        self.previous_event.clear()
+                        self.skip_event.clear()
 
-                        with self.lock:
-                            replay_song = dict(self.last_song) if self.last_song else None
+                        prev_song = self._resolve_previous()
 
-                        if replay_song is None:
-                            print("\nNo previous song to replay.")
+                        if prev_song is None:
+                            print("\nNo earlier songs in this place's history.")
                             continue
 
-                        self._score_replay(replay_song)
+                        try:
+                            current.kill()
+                        except Exception:
+                            pass
 
-                        current.kill()
+                        current = self._switch_to(prev_song)
+                        self._replayed_now = True
 
-                        current = self.prepare_song(replay_song['link'])
-
-                        with self.lock:
-                            self.last_song = dict(self.current_song) if self.current_song is not None else None
-                            self.current_process = current
-                            self.current_url = replay_song['link']
-                            self.current_song = replay_song
-                            self.current_title = replay_song['name']
-                            self.current_length = replay_song['duration']
-                            self.current_start_time = time.time()
-                            self.current_elapsed = None
-                            self.current_rating = None
-
-                        print(f"\nNow playing (replayed): {replay_song['name']}")
+                        print(f"\nNow playing (replayed): {prev_song['name']}")
                         continue
 
                     if self.seek_forward_event.is_set() or self.seek_backward_event.is_set():
@@ -283,14 +367,10 @@ class Player:
                                 continue
                             target = max(0.0, target)
                         else:
-                            # can't seek back beyond the start -> go to previous song
+                            # can't seek back beyond the start -> restart the song
                             if elapsed <= 0.5:
-                                if self.last_song is not None:
-                                    print("\nAt start of song — going to previous...")
-                                    self.replay()
-                                else:
-                                    print("\nAt start of song — restarting...")
-                                    self.restart()
+                                print("\nAt start of song — restarting...")
+                                self.restart()
                                 continue
                             target = max(0.0, target)
 
@@ -316,6 +396,20 @@ class Player:
                         if self.stop_event.is_set():
                             break
 
+                        # Stepped back into history? Skip moves FORWARD within the
+                        # window (B -> C), not on to a new live song (D).
+                        window_next = self._resolve_forward()
+                        if window_next is not None:
+                            self._score_current_song(end_reason='skipped')
+                            try:
+                                current.kill()
+                            except Exception:
+                                pass
+                            current = self._switch_to(window_next)
+                            self._replayed_now = True
+                            print(f"\nNow playing (replayed): {window_next['name']}")
+                            continue
+
                         current_song, current = self._next_play(current, get_next_song, end_reason='skipped')
 
                         if current_song is None:
@@ -337,6 +431,20 @@ class Player:
 
                         if self.stop_event.is_set():
                             break
+
+                        # A replayed history song ended: step forward inside the
+                        # window (B -> C) instead of picking up a new live song.
+                        window_next = self._resolve_forward()
+                        if window_next is not None:
+                            self._score_current_song(end_reason='finished')
+                            try:
+                                current.kill()
+                            except Exception:
+                                pass
+                            current = self._switch_to(window_next)
+                            self._replayed_now = False
+                            print(f"\nNow playing: {window_next['name']}")
+                            continue
 
                         current_song, current = self._next_play(current, get_next_song)
 
@@ -442,23 +550,7 @@ class Player:
         song['liked'] = liked
         song['skipp'] = skipp
         song['end_reason'] = end_reason
-        song['replayed'] = 0
-        self.save_queue.put(song)
-        self._last_scored_song_id = song.get('id')
-
-    def _score_replay(self, song):
-        """Update for a replayed song: a deliberate replay is the strongest like signal."""
-        with self.lock:
-            song = dict(song)
-
-        self._record_genre(song)
-
-        print(f"'{song['name']}' replayed — liked: 0 (like)")
-        song['likeability'] = 1.0
-        song['liked'] = 0
-        song['skipp'] = None
-        song['end_reason'] = 'finished'
-        song['replayed'] = 1
+        song['replayed'] = 1 if self._replayed_now else 0
         self.save_queue.put(song)
         self._last_scored_song_id = song.get('id')
 
@@ -483,7 +575,8 @@ class Player:
         process = self.prepare_song(song['link'])
 
         with self.lock:
-            self.last_song = dict(self.current_song) if self.current_song is not None else None
+            outgoing = dict(self.current_song) if self.current_song is not None else None
+            self.last_song = outgoing
             self.current_process = process
             self.current_url = song['link']
             self.current_song = song
@@ -491,6 +584,9 @@ class Player:
             self.current_length = song['duration']
             self.current_start_time = time.time()
             self.current_rating = None
+
+        self._record_live_song(song)
+        self._replayed_now = False
 
         return song, process
 
@@ -507,7 +603,7 @@ class Player:
             fd = sys.stdin.fileno()
             old_settings = termios.tcgetattr(fd)
 
-        print("n = next | s = stop | r = replay previous song | a = restart song | <- / -> = seek back / forward 5s | 0 = like | 1 = dislike")
+        print("n = next | s = stop | r = previous song | a = restart song | <- / -> = seek back / forward 5s | 0 = like | 1 = dislike")
 
         try:
             if not is_windows:
@@ -567,8 +663,8 @@ class Player:
                     self.stop()
 
                 elif key == 'r':
-                    print("\nReplaying the song that played before this one...")
-                    self.replay()
+                    print("\nGoing to the previous song...")
+                    self.play_previous()
 
                 elif key == 'a':
                     print("\nRestarting current song from the beginning...")

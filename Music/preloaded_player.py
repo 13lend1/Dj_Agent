@@ -85,12 +85,24 @@ class PreloadedPlayer(Player):
             # already covers playback, so there is no need to keep scraping.
             time.sleep(check_interval if dry_rounds < 3 else 60)
 
-    def _batch_worker(self, check_interval=2):
+    def _batch_worker(self, check_interval=2, first_batch_n=3):
+        """Keep the queue stocked.
+
+        The first fetch is a SMALL batch: as soon as ~`first_batch_n` full
+        songs exist in the Preprocessed pool they are pulled and run through
+        the whole pipeline (model -> agent), so playback starts fast while
+        still being model-scored and agent-ordered. Everything after that is
+        the normal scored batching."""
+        if first_batch_n is None:
+            first_batch_n = getattr(self, 'first_batch_n', None)
+        if first_batch_n is None:
+            first_batch_n = 3
+        first = True
         while not self.stop_event.is_set():
             try:
                 with self.batch_lock:
                     queued = len(self.batch)
-                if queued >= self.top_n - 5:
+                if not first and queued >= self.top_n - 5:
                     time.sleep(check_interval)
                     continue
 
@@ -98,17 +110,17 @@ class PreloadedPlayer(Player):
                 last_print = 0
                 max_wait = 90.0  # hard cap: never wait forever for a tiny pool
 
-                # Don't stall playback waiting for a full pool: the first batch plays the
-                # first ~10 fetched songs as soon as they exist (capped so a cold
-                # place never waits for the whole pipeline), and a half-full pool
-                # after a short wait is better than silence.
-                min_needed = 1 if getattr(self, '_trial', False) else min(max(self.top_n, 3), 10)
+                # The first batch fires on the small count so a cold pool starts
+                # fast; a half-full pool after a short wait beats silence.
+                min_needed = first_batch_n if first else (
+                    1 if getattr(self, '_trial', False) else min(max(self.top_n, 3), 10)
+                )
 
                 while not self.stop_event.is_set():
                     count = preprocessed_count(place=getattr(self, 'place', None))
                     now = time.time()
                     if count == 0 and now - last_print >= 15:
-                        print("Waiting for the first candidates... (pool is empty)")
+                        print("Waiting for candidates... (pool is empty)")
                         last_print = now
                     if count >= min_needed:
                         break
@@ -128,14 +140,19 @@ class PreloadedPlayer(Player):
                 if self.stop_event.is_set():
                     return
 
-                self._fetch_batch()
+                if first:
+                    self._fetch_batch(n=first_batch_n, small=True)
+                    first = False
+                else:
+                    self._fetch_batch()
             except Exception as e:
                 print("Batch error:")
                 traceback.print_exc()
                 time.sleep(check_interval)
 
-    def _fetch_batch(self):
-        candidates = take_preprocessed_batch(n=self.pool_size, place=getattr(self, 'place', None))
+    def _fetch_batch(self, n=None, small=False):
+        candidates = take_preprocessed_batch(
+            n=(n or self.pool_size), place=getattr(self, 'place', None))
         if not candidates:
             return
 
@@ -312,7 +329,8 @@ class PreloadedPlayer(Player):
         process = song['process']
 
         with self.lock:
-            self.last_song = dict(self.current_song) if self.current_song is not None else None
+            outgoing = dict(self.current_song) if self.current_song is not None else None
+            self.last_song = outgoing
             self.current_process = process
             self.current_url = song['link']
             self.current_song = song
@@ -321,9 +339,14 @@ class PreloadedPlayer(Player):
             self.current_start_time = time.time()
             self.current_rating = None
 
+        self._record_live_song(song)
+        self._replayed_now = False
+
         return song, process
 
     def play(self, first_song, get_next_song, sink=None):
+
+        self._reset_session()
 
         current = self.prepare_song(first_song['link'])
         with self.lock:
@@ -334,13 +357,14 @@ class PreloadedPlayer(Player):
             self.current_length = first_song['duration']
             self.current_start_time = time.time()
             self.current_rating = None
+        self._record_live_song(first_song)
         print(f"Now playing: {self.current_title}")
         self.start_preload(get_next_song)
 
         print("\nDJ started!")
         print("n = next")
         print("s = stop")
-        print("r = replay the song that played before this one")
+        print("r = previous song (steps back through this place's history)")
         print("a = restart current song from the beginning")
         print("<- / -> = seek back / forward 5 seconds")
         print("Ctrl+C = stop\n")
@@ -375,35 +399,26 @@ class PreloadedPlayer(Player):
                         print(f"\nRestarting from the beginning: {song['name']}")
                         continue
 
-                    if self.replay_event.is_set():
+                    if self.previous_event.is_set():
 
-                        self.replay_event.clear()
+                        self.previous_event.clear()
+                        self.skip_event.clear()
 
-                        with self.lock:
-                            replay_song = dict(self.last_song) if self.last_song else None
+                        prev_song = self._resolve_previous()
 
-                        if replay_song is None:
-                            print("\nNo previous song to replay.")
+                        if prev_song is None:
+                            print("\nNo earlier songs in this place's history.")
                             continue
 
-                        self._score_replay(replay_song)
+                        try:
+                            current.kill()
+                        except Exception:
+                            pass
 
-                        current.kill()
+                        current = self._switch_to(prev_song)
+                        self._replayed_now = True
 
-                        current = self.prepare_song(replay_song['link'])
-
-                        with self.lock:
-                            self.last_song = dict(self.current_song) if self.current_song is not None else None
-                            self.current_process = current
-                            self.current_url = replay_song['link']
-                            self.current_song = replay_song
-                            self.current_title = replay_song['name']
-                            self.current_length = replay_song['duration']
-                            self.current_start_time = time.time()
-                            self.current_elapsed = None
-                            self.current_rating = None
-
-                        print(f"\nNow playing (replayed): {replay_song['name']}")
+                        print(f"\nNow playing (replayed): {prev_song['name']}")
                         continue
 
                     if self.seek_forward_event.is_set() or self.seek_backward_event.is_set():
@@ -428,12 +443,8 @@ class PreloadedPlayer(Player):
                             target = max(0.0, target)
                         else:
                             if elapsed <= 0.5:
-                                if self.last_song is not None:
-                                    print("\nAt start of song — going to previous...")
-                                    self.replay()
-                                else:
-                                    print("\nAt start of song — restarting...")
-                                    self.restart()
+                                print("\nAt start of song — restarting...")
+                                self.restart()
                                 continue
                             target = max(0.0, target)
 
@@ -459,6 +470,20 @@ class PreloadedPlayer(Player):
                         if self.stop_event.is_set():
                             break
 
+                        # Stepped back into history? Skip moves FORWARD within the
+                        # window (B -> C), not on to a new live song (D).
+                        window_next = self._resolve_forward()
+                        if window_next is not None:
+                            self._score_current_song(end_reason='skipped')
+                            try:
+                                current.kill()
+                            except Exception:
+                                pass
+                            current = self._switch_to(window_next)
+                            self._replayed_now = True
+                            print(f"\nNow playing (replayed): {window_next['name']}")
+                            continue
+
                         current_song, current = self._settle_next(current, get_next_song, end_reason='skipped')
 
                         if current_song is None:
@@ -481,6 +506,20 @@ class PreloadedPlayer(Player):
 
                         if self.stop_event.is_set():
                             break
+
+                        # A replayed history song ended: step forward inside the
+                        # window (B -> C) instead of picking up a new live song.
+                        window_next = self._resolve_forward()
+                        if window_next is not None:
+                            self._score_current_song(end_reason='finished')
+                            try:
+                                current.kill()
+                            except Exception:
+                                pass
+                            current = self._switch_to(window_next)
+                            self._replayed_now = False
+                            print(f"\nNow playing: {window_next['name']}")
+                            continue
 
                         current_song, current = self._settle_next(current, get_next_song)
 

@@ -39,7 +39,11 @@ class StreamSink:
     # TCP, encoder lag) drains it to zero and fires <audio>'s `waiting`. A
     # generous seed is SUSTAINED headroom: the seed plays out at realtime while
     # live audio arrives at realtime, so the cushion never shrinks in normal
-    # operation. ~3s absorbs real jitter without much join lag.
+    # operation. The seed also sets how far the browser rides BEHIND the live
+    # edge — the older it is, the less "live" playback feels (song changes and
+    # skips appear seconds late). ~3s keeps the stall->reconnect loop from degrading
+    # to "a second of audio then buffer" at natural song changes; skip/previous
+    # reconnects are fresh (no seed) so their cut stays instant regardless.
     _PREBUFFER_BYTES = 48000  # ~3 s at 128 kbit/s
 
     # Silence-filler: once real PCM has been absent this long, stream silence
@@ -50,7 +54,7 @@ class StreamSink:
     # long dry spell (empty pool, dead link) would bury the next song under
     # dead air.
     _FILL_AFTER_SECS = 0.28
-    _FILL_LEAD_SECS = 2.0
+    _FILL_LEAD_SECS = 6.0
     _FILL_CHUNK_FRAMES = 4096  # 4096 stereo int16 frames ~= 93 ms; same as the DJ's writes
     _FILL_CHUNK_BYTES = _FILL_CHUNK_FRAMES * 2 * 2
     _FILL_FEED_GAP = 0.01  # sleep between filler writes: fast, but not a busy-spin
@@ -206,15 +210,20 @@ class StreamSink:
             ):
                 time.sleep(0.05)
                 continue
+            # NEVER write while holding the lock: a backpressured encoder (full
+            # stdout pipe) blocks in stdin.write, and holding the lock through
+            # it would freeze write()/subscribe()/close() — and with them the
+            # DJ's audio loop. Update the lead under the lock, write outside it.
+            with self._lock:
+                if self._dead:
+                    return
+                # _last_write is only ever touched by real PCM writes, so a
+                # chain of silence chunks feeds fast (one per loop) instead
+                # of resetting the dry-detection clock every chunk.
+                lead = lead + self._FILL_CHUNK_FRAMES / self.RATE
+                self._silence_lead = lead
             try:
-                with self._lock:
-                    if self._dead:
-                        return
-                    # _last_write is only ever touched by real PCM writes, so a
-                    # chain of silence chunks feeds fast (one per loop) instead
-                    # of resetting the dry-detection clock every chunk.
-                    self._silence_lead = lead + self._FILL_CHUNK_FRAMES / self.RATE
-                    enc.stdin.write(silence)
+                enc.stdin.write(silence)
             except (BrokenPipeError, ValueError, OSError):
                 self.close()
                 return
@@ -224,12 +233,20 @@ class StreamSink:
 
     def _read_loop(self):
         fd = self._enc.stdout.fileno()
+        os.set_blocking(fd, False)
         while self._enc is not None:
             try:
-                # Small reads = small initial browser buffer: the <audio>
-                # element can start and stay closer to the live edge instead of
-                # sitting on half-second slabs of MP3.
+                # Non-blocking small reads = small initial browser buffer (the
+                # <audio> element can start and stay closer to the live edge
+                # instead of sitting on half-second slabs of MP3) AND, critically,
+                # the encoder's stdout is ALWAYS drained. A blocking 4096-byte
+                # read can sit on a near-empty pipe while ffmpeg dribbles MP3
+                # frames; once the pipe fills, ffmpeg stalls and the whole sink
+                # (and the DJ writing into it) backs up. Empty waits just loop.
                 chunk = os.read(fd, 4096)
+            except BlockingIOError:
+                time.sleep(0.002)
+                continue
             except OSError:
                 break
             if not chunk:
@@ -253,7 +270,7 @@ class StreamSink:
 
     def subscribe(self, fresh=False):
         # The queue bounds how far a lagging browser can drift from the live
-        # edge (~32s) while still fitting the ~3s seed + ~2s silence lead +
+        # edge (~32s) while still fitting the ~3s seed + ~6s silence lead +
         # live tail. New subscribers start pre-seeded with the most recent audio
         # (instant start, sustained jitter cushion), then ride the live edge.
         # `fresh=True` (used by skip / previous / restart / resume): skip the

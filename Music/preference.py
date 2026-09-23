@@ -132,7 +132,11 @@ def custom_places():
 
 def add_place(name, genres):
     """Create (or replace) a user-defined place and persist it. Returns the
-    normalized key. Raises ValueError when the name or genres are unusable."""
+    normalized key. When the name is reused (redefining the place), the stale
+    tracked-pool rows for it are purged too so a place that changes its genres
+    never keeps playing the OLD place's tracks (e.g. 'test' was hip-hop, gets
+    re-added as pop — the leftover hip-hop catalog must not still play).
+    Raises ValueError when the name or genres are unusable."""
     key = normalize_place(name)
     if not key:
         raise ValueError("a place name is required")
@@ -143,12 +147,36 @@ def add_place(name, genres):
             clean.append(genre)
     if not clean:
         raise ValueError("pick at least one genre for the new place")
+
     _CUSTOM_PLACES[key] = clean
     PLACE_GENRES[key] = clean
     data = _read_places_file()
     data["places"] = dict(_CUSTOM_PLACES)
     _write_places_file(data)
+    # Always purge (no-op when nothing is stale). This MUST NOT be gated on the
+    # key being in memory right now: the stale Preprocessed rows tagged with
+    # this place name survive in the DB even after places.json is deleted and
+    # the key drops out of PLACE_GENRES. Re-adding "test" as pop after it was
+    # hip-hop must never keep serving the leftover hip-hop rows just because
+    # the key wasn't in PLACE_GENRES at add time — so purge unconditionally.
+    _purge_stale_tracked(key, clean)
     return key
+
+
+def _purge_stale_tracked(place, genres):
+    """Delete the tracked-pool rows of `place` whose genre is no longer part of
+    `genres` — the rows that would otherwise play sounds for a genre the place
+    no longer wants. Runs OUTSIDE the dict update so a failed purge can never
+    roll back a valid place change."""
+    try:
+        from Music.songs import purge_stale_preprocessed
+        removed = purge_stale_preprocessed(place, genres)
+        if removed:
+            print(f"Purged {removed} stale pool row(s) for '{place}' that no "
+                  f"longer match its current genres.", flush=True)
+    except Exception as e:
+        print("Could not purge stale pool rows for",
+              f"'{place}':", e)
 
 
 def get_active_place():

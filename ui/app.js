@@ -25,6 +25,10 @@ async function post(url, body) {
 
 const audio = $("audio");
 let audioOn = false;
+// The deck is paused (either the user clicked pause or a poll reported the
+// server paused). While set, NOTHING may play or reconnect the <audio> element
+// — a paused DJ must be silent, even if buffered audio or watchdog events fire.
+let audioPaused = false;
 
 const COVER_URL = `${CONTROL_URL}/cover`;
 let lastSongKey = "";
@@ -36,9 +40,14 @@ const STREAM_URL = "/api/control/stream";
 let audioBuffering = false;
 let lastReconnectAt = 0;
 let stallTimer = null;
+// Timestamp of the last explicit resume: the poll right after a resume can
+// still catch the server mid-transition (paused), so the defensive pause
+// below must not re-freeze an element that was just told to play.
+let lastResumeAt = 0;
 
 function startAudio() {
   if (audioOn) return;
+  audioPaused = false;
   audio.src = `${STREAM_URL}?_=${Date.now()}`;
   audio
     .play()
@@ -47,15 +56,19 @@ function startAudio() {
 }
 
 function reconnectAudio(opts) {
-  if (!audioOn) return;
+  if (!audioOn || audioPaused) return;
   const now = Date.now();
-  if (now - lastReconnectAt < 1200) return; // don't livelock on a wild blip
+  // `force` (deliberate user moves: skip / previous) snaps the browser to the
+  // live edge EVEN if a background resync happened a moment ago — the 1.2s
+  // throttle only guards the watchdog, never a real button press.
+  const force = !!(opts && opts.force);
+  if (!force && now - lastReconnectAt < 1200) return;
   lastReconnectAt = now;
   // Force a brand-new connection: reusing the same URL lets the browser keep
   // playing (and re-buffer) audio the DJ has already moved past, which is what
   // made skips/seeks feel seconds behind. The cache-buster guarantees a fresh
   // stream subscribed at the live edge (and pre-seeded, so it starts at once).
-  // When `fresh` is set (skip / previous / restart), the subscription skips the
+  // When `fresh` is set (skip / previous / full), the subscription skips the
   // pre-seed too: replaying the outgoing song's last ~0.75s read as "the next
   // song is buffering", so these cuts land cleanly on the new song instead.
   audioBuffering = true;
@@ -71,7 +84,7 @@ function resyncSoon() {
   // moments nothing is being written to the sink (e.g. a slow download between
   // two songs) — show BUFFERING briefly, then snap back to the live edge.
   clearTimeout(stallTimer);
-  stallTimer = setTimeout(() => { if (audioOn && audioBuffering) reconnectAudio(); }, 1500);
+  stallTimer = setTimeout(() => { if (audioOn && !audioPaused && audioBuffering) reconnectAudio(); }, 1500);
 }
 
 function bindAudioWatchdog() {
@@ -79,16 +92,16 @@ function bindAudioWatchdog() {
   // element's own events drive it: the moment it reports it can't advance
   // while the DJ is still playing, snap to the live edge instead of leaving
   // the page silently stuck on a buffer.
-  audio.addEventListener("waiting", () => { audioBuffering = true; resyncSoon(); });
-  audio.addEventListener("stalled", () => { audioBuffering = true; resyncSoon(); });
+  audio.addEventListener("waiting", () => { if (!audioPaused) { audioBuffering = true; resyncSoon(); } });
+  audio.addEventListener("stalled", () => { if (!audioPaused) { audioBuffering = true; resyncSoon(); } });
   audio.addEventListener("playing", () => { audioBuffering = false; clearTimeout(stallTimer); });
   audio.addEventListener("canplay", () => { audioBuffering = false; clearTimeout(stallTimer); });
   audio.addEventListener("error", () => {
-    if (audioOn) setTimeout(reconnectAudio, 400);
+    if (audioOn && !audioPaused) setTimeout(reconnectAudio, 400);
   });
   audio.addEventListener("ended", () => {
     // Server closed the stream (sink shut down) or the connection died.
-    if (audioOn) reconnectAudio();
+    if (audioOn && !audioPaused) reconnectAudio();
   });
 }
 
@@ -284,6 +297,7 @@ function renderStatus(s) {
     // gate. Changing place is Stop -> pick -> Start, so this is the only screen
     // that can retarget the DJ.
     if (audioOn) { audio.pause(); audioOn = false; }
+    audioPaused = false;
     setDeviceStatus(false);
     setPauseButton(false);
     $("state-label2").textContent = "STANDBY";
@@ -307,6 +321,14 @@ function renderStatus(s) {
   closeGate();
   const paused = !!s.paused;
   const transitioning = !!s.transitioning;
+  // Defense-in-depth for the pause leak: even if a pause click never reached
+  // us (slow POST, another tab, a poll that caught the transition), the moment
+  // a poll says the deck is paused the element must freeze NOW. Buffered audio
+  // must never keep pouring out of a paused deck.
+  if (paused && audioOn && !audio.paused && Date.now() - lastResumeAt > 1500) {
+    audioPaused = true;
+    audio.pause();
+  }
   if (!pausePending) {
     setDeviceStatus(s.playing && !paused);
     setPauseButton(paused);
@@ -561,39 +583,66 @@ async function gateCreate() {
 // Actions that move where the DJ is playing: the <audio> element buffers
 // ahead of the live edge, so without reconnecting the browser would keep
 // playing the song we just skipped away from. Reconnect snaps it to "now".
-// skip / previous / restart also reconnect FRESH (no tail seed) so the next
+// skip / full / previous also reconnect FRESH (no tail seed) so the next
 // song starts cleanly instead of replaying the outgoing song's last moments.
-const RECONNECT = new Set(["skip", "previous", "restart", "seek-forward", "seek-backward"]);
-const FRESH = new Set(["skip", "previous", "restart"]);
+const RECONNECT = new Set(["skip", "previous", "full", "seek-forward", "seek-backward"]);
+const FRESH = new Set(["skip", "previous", "full"]);
+// User moves that change which song plays: their audio must cut the instant
+// the button is pressed — the browser sits a couple of seconds behind the live
+// edge, so without an immediate forced reconnect you'd keep hearing the buffered
+// outgoing song. Skips snap the browser to "now" at the click, then re-anchor
+// once the server confirms the new song is actually playing.
+const INSTANT = new Set(["skip", "previous"]);
 
 async function act(action) {
+  if (INSTANT.has(action)) {
+    // Cut the outgoing song at the moment of the press, before the POST round
+    // trip reaches the server: drop the ~3s of buffered audio and land on the
+    // live edge. When the cut lands a moment later, the SAME stream carries the
+    // transition + next song straight into the element.
+    reconnectAudio({ fresh: true, force: true });
+  }
   if (action === "pause") {
     const willPause = !$("pause-btn").classList.contains("paused");
     pausePending++;
     setPauseButton(willPause);
     setDeviceStatus(audioOn && !willPause);
+    if (willPause) {
+      // Pause the element IMMEDIATELY, before the POST round-trip: buffered
+      // audio must not keep playing for the ~100ms+ it takes the backend to
+      // confirm. This is the "pause is on but sound still passes" leak.
+      audioPaused = true;
+      if (audioOn) audio.pause();
+    }
   }
   flash(`\u2192 ${action}...`);
   try {
     const res = await post(`${CONTROL_URL}/${action}`);
     if (action === "pause") {
       if (res.paused) {
-        if (audioOn) audio.pause();
+        if (audioOn && !audio.paused) audio.pause();
+        audioPaused = true;
         flash("\u23F8 paused");
       } else {
+        // Resume: forget the paused state and snap the element back live.
+        audioPaused = false;
+        lastResumeAt = Date.now();
         reconnectAudio({ fresh: true });
         flash("\u25B6 resumed");
       }
-    } else if (action === "previous" && res.replayed === false) {
-      flash("no previous song yet");
     } else if (action === "stop") {
       if (audioOn) { audio.pause(); audioOn = false; }
+      audioPaused = false;
       flash("\u25A0 stopped \u2014 pick a place to start again");
+    } else if (action === "previous" && res.replayed === false) {
+      flash("no earlier songs yet");
     } else {
       flash(`\u2713 ${res.action || action} sent`);
     }
     if (RECONNECT.has(action)) {
-      reconnectAudio({ fresh: FRESH.has(action) });
+      // Skip / previous re-anchor FORCED so the throttle can never swallow the
+      // user's move: the browser locks onto the new song's live edge.
+      reconnectAudio({ fresh: FRESH.has(action), force: INSTANT.has(action) });
     }
     refreshStatusSoon();
   } catch (e) {
@@ -653,7 +702,7 @@ setInterval(() => {
   // A genuinely stalled element (readyState stuck below HAVE_FUTURE_DATA while
   // still marked as buffering) counts the same way, even if the element didn't
   // pause itself — no amount of waiting fixes "no data flowing".
-  if (!audioOn || !lastStatus || !lastStatus.playing || lastStatus.paused) return;
+  if (!audioOn || audioPaused || !lastStatus || !lastStatus.playing || lastStatus.paused) return;
   const stuck = audio.paused
     ? (audio.readyState <= 2 && audio.currentTime > 0)
     : (audioBuffering && audio.readyState <= 2);

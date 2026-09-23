@@ -919,7 +919,6 @@ def save_preprocessed(song):
 
 
 def peek_preprocessed(limit=100):
-    """Pulls a candidate pool without removing anything — scoring decides what plays."""
     def _run(conn):
         _ensure_preprocessed_place(conn)
         rows = conn.execute(
@@ -983,6 +982,36 @@ def remove_from_preprocessed(ids):
     _db_exec(_run)
 
 
+def purge_stale_preprocessed(place, genres):
+    """Deletes the Preprocessed rows of `place` whose genre is no longer part
+    of `genres`. Called whenever a place is (re)created so a place whose genres
+    change — e.g. 'test' was hip-hop, gets re-added as pop — never keeps playing
+    the OLD place's tracks. Returns the number of rows removed (0 is fine)."""
+    if not place:
+        return 0
+
+    def _run(conn):
+        _ensure_preprocessed_place(conn)
+        placeholders = ",".join("?" for _ in (genres or []))
+        if placeholders:
+            sql = ("DELETE FROM Preprocessed WHERE place = ? AND "
+                   "(genre IS NULL OR genre NOT IN (%s))" % placeholders)
+            params = (place,) + tuple(genres)
+        else:
+            sql = "DELETE FROM Preprocessed WHERE place = ?"
+            params = (place,)
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            cur = conn.execute(sql, params)
+            removed = cur.rowcount
+            conn.execute("COMMIT")
+            return removed
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+    return _db_exec(_run)
+
+
 def preprocessed_count(place=None):
     def _run(conn):
         if place:
@@ -993,31 +1022,49 @@ def preprocessed_count(place=None):
 
 
 def recycle_played_songs(n=20, place=None):
-    """Pull up to n already-played, feature-complete songs back for reuse once
-    every discoverable candidate has been played, so the DJ keeps playing
-    forever instead of running dry. Random rows are sampled from the scored
-    Songs table (rows must carry a likeability to survive delete_unscored_songs).
+    """Pull scored songs back into rotation so the DJ keeps playing once the
+    fresh/unplayed pool runs low. PLAYED state is the gate — not the place tag:
+    places are genre bundles, so a song fetched for one place legitimately fits
+    another that shares its genre (a morning-fetched "house" track is a fine
+    rave track). Two tiers:
 
-    Returns an (possibly empty) list of song dicts — empty only when nothing
-    was ever played/scored yet, in which case fresh discovery is still the only
-    source and playback simply keeps waiting for it."""
+    1) First pass: scored, NEVER-played songs in the place's genres — airtime
+       for anything scored but not yet heard (under any place's tag).
+    2) Backfill: only if tier 1 can't fill n does it fall back to ALREADY-played
+       songs, so replays happen only when the catalog is genuinely exhausted.
+
+    Rows must carry likeability to survive delete_unscored_songs. Empty only
+    when nothing has ever been scored in the place's genres yet, in which case
+    fresh discovery is still the only source and playback keeps waiting."""
     def _run(conn):
         cols = [d[0] for d in conn.execute("SELECT * FROM Songs LIMIT 0").description]
         if place and PLACE_GENRES.get(place):
             genres = list(PLACE_GENRES[place])
             marks = ",".join("?" for _ in genres)
-            rows = conn.execute(
-                f"SELECT * FROM Songs WHERE likeability IS NOT NULL "
-                f"AND genre IN ({marks}) ORDER BY RANDOM() LIMIT ?",
-                (*genres, n),
-            ).fetchall()
+            where = f"genre IN ({marks})"
+            params = list(genres)
         else:
-            rows = conn.execute(
-                "SELECT * FROM Songs WHERE likeability IS NOT NULL "
-                "ORDER BY RANDOM() LIMIT ?",
-                (n,),
-            ).fetchall()
-        return [dict(zip(cols, r)) for r in rows]
+            where = "1 = 1"
+            params = []
+        rows = conn.execute(
+            "SELECT * FROM Songs WHERE likeability IS NOT NULL AND " + where +
+            " ORDER BY RANDOM() LIMIT 2000",
+            params,
+        ).fetchall()
+        # ids already played: a song appears in any per-genre played table
+        # (mirrors duplicates.is_played's global view, on the same connection).
+        from duplicates import NON_GENRE_TABLES
+        tables = [t[0] for t in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'").fetchall()
+            if t[0] not in NON_GENRE_TABLES]
+        played = set()
+        for t in tables:
+            for (sid,) in conn.execute(f'SELECT id FROM "{t}"'):
+                played.add(sid)
+        songs = [dict(zip(cols, r)) for r in rows]
+        fresh = [s for s in songs if s.get('id') not in played]
+        used = [s for s in songs if s.get('id') in played]
+        return (fresh + used)[:n]
     try:
         return _db_exec(_run)
     except Exception as e:

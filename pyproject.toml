@@ -15,4 +15,8 @@ dependencies = [
     "sounddevice",
     "fastapi",
     "uvicorn",
+    "requests",
+    "google-genai",
+    "python-dotenv",
+    "curl-cffi",
 ]

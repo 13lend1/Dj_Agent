@@ -26,6 +26,26 @@ _COVER_CACHE = {}
 _COVER_LOCK = threading.Lock()
 _COVER_INFLIGHT = {}
 _COVER_WARMING = set()
+
+# Collapse duplicate control POSTs that land within the same ~300ms. The
+# page's in-page Ctrl+Alt handler and the global hotkey daemon (hotkeys.py)
+# BOTH fire when a combo is pressed while the tab is focused, so one keypress
+# would otherwise execute the action twice (e.g. skip two songs).
+_DEBOUNCE_WINDOW = 0.30
+_debounce_at = {}
+_debounce_lock = threading.Lock()
+
+
+def _debounced(key):
+    now = time.monotonic()
+    with _debounce_lock:
+        last = _debounce_at.get(key)
+        if last is not None and now - last < _DEBOUNCE_WINDOW:
+            return True
+        _debounce_at[key] = now
+        return False
+
+
 # Each release-group probe is one HTTP round trip; a MusicBrainz recording can
 # list a dozen pressings, so cap how many we hand to the Cover Art Archive or a
 # single cover lookup can walk them all and take several seconds.
@@ -77,6 +97,25 @@ def _dj():
     if dj is None:
         raise HTTPException(503, "DJ is not running (started with --no-dj).")
     return dj
+
+
+def _shape_song(song, rating, elapsed):
+    """The now-playing snapshot both /status and the action endpoints return,
+    shaped from a raw song dict read under the player lock."""
+    if song is None:
+        return None
+    return {
+        "title": song.get("name"),
+        "artist": song.get("artist"),
+        "genre": song.get("genre"),
+        "place": song.get("place"),
+        "duration_ms": song.get("duration"),
+        "play_start_sec": song.get("play_start_sec"),
+        "play_end_sec": song.get("play_end_sec"),
+        "likeability": song.get("likeability"),
+        "rating": rating,
+        "elapsed_sec": round(elapsed, 1) if elapsed is not None else None,
+    }
 
 
 @router.get("/status")
@@ -151,7 +190,10 @@ def status():
     if preparing:
         try:
             from Music.songs import preprocessed_count
-            ready_count = preprocessed_count(place=getattr(dj, "place", None)) + len(queued)
+            from Music.preference import PLACE_GENRES
+            place = getattr(dj, "place", None)
+            genres = PLACE_GENRES.get(place) if place else None
+            ready_count = preprocessed_count(genres=genres) + len(queued)
         except Exception:
             ready_count = None
 
@@ -167,18 +209,7 @@ def status():
         "transitioning": transitioning,
         "stopping": stopping,
         "place": getattr(dj, "place", None) or None,
-        "song": {
-            "title": song.get("name"),
-            "artist": song.get("artist"),
-            "genre": song.get("genre"),
-            "place": song.get("place"),
-            "duration_ms": song.get("duration"),
-            "play_start_sec": song.get("play_start_sec"),
-            "play_end_sec": song.get("play_end_sec"),
-            "likeability": song.get("likeability"),
-            "rating": rating,
-            "elapsed_sec": round(elapsed, 1) if elapsed is not None else None,
-        } if song else None,
+        "song": _shape_song(song, rating, elapsed),
         "previous": {
             "title": previous.get("name"),
             "artist": previous.get("artist"),
@@ -426,9 +457,41 @@ def set_place(body: PlaceBody):
 
 @router.post("/skip")
 def skip():
+    if _debounced("skip"):
+        # Duplicate from the in-page handler racing the global hotkey daemon.
+        return {"ok": True, "action": "skip", "debounced": True}
     dj = _dj()
+    with dj.lock:
+        before = dj.current_song
     dj.skip()
-    return {"ok": True, "action": "skip"}
+    return _skip_result(dj, before)
+
+
+def _skip_result(dj, before):
+    """The audio loop picks the skip up and swaps songs just after this POST
+    returns. Wait (bounded) for the swap so the response can carry the NEW
+    song measured at the instant it started — the page then renders it the
+    moment the POST lands instead of lagging a status poll behind the audio.
+    If the queue is empty the skip re-arms and keeps the current song; in
+    that case we time out and report whatever is actually playing."""
+    changed = None
+    deadline = time.monotonic() + 0.8
+    while time.monotonic() < deadline:
+        with dj.lock:
+            cur = dj.current_song
+            if cur is not None and cur is not before:
+                changed = (dict(cur), dj._elapsed_locked(), dj.current_rating)
+                break
+        time.sleep(0.02)
+    if changed is None:
+        with dj.lock:
+            changed = (
+                dict(dj.current_song) if dj.current_song is not None else None,
+                dj._elapsed_locked(),
+                dj.current_rating,
+            )
+    song, elapsed, rating = changed
+    return {"ok": True, "action": "skip", "song": _shape_song(song, rating, elapsed)}
 
 
 @router.post("/full")
@@ -436,6 +499,8 @@ def full():
     """Play the current song to its full length: keep the play position but
     drop the hook end-cap so it runs to the track's real end. Counts as a strong
     like signal (like replay: score +350, confidence 1.0) when scored."""
+    if _debounced("full"):
+        return {"ok": True, "action": "full", "debounced": True}
     dj = _dj()
     dj.play_whole()
     return {"ok": True, "action": "full"}
@@ -480,6 +545,10 @@ def pause():
     clock stands still, so the UI's progress bar holds. Resuming shifts the
     song clock past the paused span and picks up where it left off."""
     dj = _dj()
+    if _debounced("pause"):
+        # Duplicate from the in-page handler racing the global hotkey daemon.
+        return {"ok": True, "action": "pause", "paused": dj.paused,
+                "debounced": True}
     dj.toggle_pause()
     return {"ok": True, "action": "pause", "paused": dj.paused}
 
@@ -493,6 +562,8 @@ def resume():
 
 @router.post("/rate")
 def rate(body: RateBody):
+    if _debounced(f"rate:{body.rating}"):
+        return {"ok": True, "rating": body.rating, "debounced": True}
     dj = _dj()
     dj.rate_current(body.rating)
     return {"ok": True, "rating": body.rating}

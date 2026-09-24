@@ -44,6 +44,10 @@ def main():
         "--speaker", action="store_true",
         help="play sound through the machine's speakers instead of the web browser",
     )
+    parser.add_argument(
+        "--no-hotkeys", action="store_true",
+        help="do not register the global Ctrl+Alt hotkeys with this server",
+    )
     args = parser.parse_args()
 
     from api import state
@@ -73,10 +77,33 @@ def main():
         else:
             print("Audio output: web browser stream (use --speaker for machine sound).")
 
+    # Ride the global Ctrl+Alt+N/L/F hotkeys along with this server: they run
+    # in a background thread of the SAME process (no extra window/terminal) and
+    # die with the server. Disable with --no-hotkeys.
+    if not args.no_hotkeys:
+        try:
+            from hotkeys import start_hotkey_thread
+            start_hotkey_thread(host=args.host, port=args.port)
+            print("Global hotkeys active: Ctrl+Alt+N skip, Ctrl+Alt+L like, "
+                  "Ctrl+Alt+F full, Ctrl+Alt+P previous, Ctrl+Alt+D dislike, "
+                  "Ctrl+Alt+Space pause (--no-hotkeys to disable).")
+        except Exception as exc:
+            print("Hotkeys unavailable:", exc)
+
     import uvicorn
 
     print(f"UI: http://{args.host}:{args.port}/")
-    uvicorn.run("api.app:app", host=args.host, port=args.port, log_level="info")
+    # timeout_graceful_shutdown: one Ctrl+C stops the DJ (via the app lifespan,
+    # which closes the StreamSink) and uvicorn force-exits after 5s even if a
+    # browser /stream connection never drains. Without this the first Ctrl+C
+    # hangs waiting for connections and you need repeated presses.
+    uvicorn.run(
+        "api.app:app",
+        host=args.host,
+        port=args.port,
+        log_level="info",
+        timeout_graceful_shutdown=5,
+    )
 
 
 if __name__ == "__main__":

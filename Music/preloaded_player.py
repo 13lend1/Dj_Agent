@@ -57,19 +57,30 @@ class PreloadedPlayer(Player):
             low_water = self.pool_size
         top_n = getattr(self, 'top_n', None) or low_water
         high_water = getattr(self, 'prefill_high_water', None) or max(2 * low_water, low_water + top_n)
-        max_chunk = 10  # lean fetch rounds: the first batch needs only ~10, so
+        max_chunk = 15  # lean fetch rounds: the first batch needs only ~10, so
         # small rounds start playback sooner and the loop chains them in the
-        # background instead of one big 50-song grab before anything plays
+        # background instead of one big grab before anything plays
         dry_rounds = 0
         while not self.stop_event.is_set():
             try:
-                count = preprocessed_count(place=getattr(self, 'place', None))
+                # The batch borrows across places but genre-filtered, so track
+                # the same matching-genre count it consumes — that keeps the
+                # pool the batch draws from stocked instead of topping only
+                # this place's own rows while the shared pool runs dry.
+                try:
+                    from Music.preference import PLACE_GENRES
+                except ImportError:
+                    from preference import PLACE_GENRES
+                _place = getattr(self, 'place', None)
+                _genres = PLACE_GENRES.get(_place) if _place else None
+                count = preprocessed_count(genres=_genres)
                 need = high_water - count
                 if need >= 5:
                     fetched = get_random_songs(
                         n=min(need, max_chunk),
                         on_song=save_preprocessed,
                         place=getattr(self, 'place', None),
+                        workers=6,
                     )
                     if not fetched or len(fetched) < min(need, max_chunk) // 2:
                         dry_rounds += 1
@@ -85,7 +96,7 @@ class PreloadedPlayer(Player):
             # already covers playback, so there is no need to keep scraping.
             time.sleep(check_interval if dry_rounds < 3 else 60)
 
-    def _batch_worker(self, check_interval=2, first_batch_n=3):
+    def _batch_worker(self, check_interval=2, first_batch_n=2):
         """Keep the queue stocked.
 
         The first fetch is a SMALL batch: as soon as ~`first_batch_n` full
@@ -96,7 +107,7 @@ class PreloadedPlayer(Player):
         if first_batch_n is None:
             first_batch_n = getattr(self, 'first_batch_n', None)
         if first_batch_n is None:
-            first_batch_n = 3
+            first_batch_n = 2
         first = True
         while not self.stop_event.is_set():
             try:
@@ -108,25 +119,36 @@ class PreloadedPlayer(Player):
 
                 wait_start = time.time()
                 last_print = 0
-                max_wait = 90.0  # hard cap: never wait forever for a tiny pool
+                max_wait = 30.0  # hard cap: never wait forever for a tiny pool
 
                 # The first batch fires on the small count so a cold pool starts
-                # fast; a half-full pool after a short wait beats silence.
+                # fast; a half-full pool after a short wait beats silence. A
+                # batch of ~3 is enough to keep playback rolling — it is refilled
+                # again in a few seconds instead of stalling until top_n exist.
                 min_needed = first_batch_n if first else (
                     1 if getattr(self, '_trial', False) else min(max(self.top_n, 3), 10)
                 )
 
                 while not self.stop_event.is_set():
-                    count = preprocessed_count(place=getattr(self, 'place', None))
+                    # The deck now draws from EVERY place's preprocessed pool,
+                    # but only tracks whose genre is part of this place's list,
+                    # so the batch decision watches that same filtered count.
+                    try:
+                        from Music.preference import PLACE_GENRES
+                    except ImportError:
+                        from preference import PLACE_GENRES
+                    _place = getattr(self, 'place', None)
+                    _genres = PLACE_GENRES.get(_place) if _place else None
+                    count = preprocessed_count(genres=_genres)
                     now = time.time()
                     if count == 0 and now - last_print >= 15:
                         print("Waiting for candidates... (pool is empty)")
                         last_print = now
                     if count >= min_needed:
                         break
-                    if now - wait_start > 45 and count >= 3:
+                    if now - wait_start > 20 and count >= 3:
                         break
-                    if count == 0 and now - wait_start > 10:
+                    if count == 0 and now - wait_start > 5:
                         # An empty pool means discovery has run dry: stop waiting
                         # and let _fetch_batch recycle already-played songs so the
                         # deck never stalls waiting on a fresh catalog.
@@ -151,8 +173,19 @@ class PreloadedPlayer(Player):
                 time.sleep(check_interval)
 
     def _fetch_batch(self, n=None, small=False):
+        # Borrow from every place's pool, but only tracks whose genre is part of
+        # this place's list (played tracks are barred below too). Take only what
+        # gets queued (top_n), never pool_size — the surplus was deleted from the
+        # pool but never played, draining it faster than discovery could refill.
+        try:
+            from Music.preference import PLACE_GENRES
+        except ImportError:
+            from preference import PLACE_GENRES
+        place = getattr(self, 'place', None)
+        genres = PLACE_GENRES.get(place) if place else None
+        take_n = min((n or self.pool_size), self.top_n)
         candidates = take_preprocessed_batch(
-            n=(n or self.pool_size), place=getattr(self, 'place', None))
+            n=take_n, genres=genres)  # any matching genre's pool
         if not candidates:
             return
 
@@ -217,7 +250,7 @@ class PreloadedPlayer(Player):
             print("No song available to preload, fetching a random one.")
             if self.stop_event.is_set():
                 return
-            song_info = get_random_song()
+            song_info = get_random_song(place=getattr(self, 'place', None))
 
         if song_info is None:
             print("Could not find a song to preload.")

@@ -27,12 +27,27 @@ _yt = None
 
 def _get_yt():
     """Shared, reusable YTMusic client (auth-free). Creating it once keeps the
-    internal session warm — searches are then fast JSON API calls."""
+    internal session warm — searches are then fast JSON API calls.
+
+    Uses Music/headers_auth.json when present (your own saved browser headers);
+    otherwise falls back to a fully anonymous client, so a fresh clone works
+    without setting up ytmusicapi."""
     global _yt
     if _yt is None:
         from ytmusicapi import YTMusic
-        _yt = YTMusic("Music/headers_auth.json")
+        _yt = _make_ytmusic_client()
     return _yt
+
+
+def _make_ytmusic_client():
+    """Return a YTMusic client, preferring Music/headers_auth.json when it
+    exists (ytmusicapi raises if handed a path that isn't a file)."""
+    from pathlib import Path
+    from ytmusicapi import YTMusic
+    headers_file = Path(__file__).with_name("headers_auth.json")
+    if headers_file.is_file():
+        return YTMusic(str(headers_file))
+    return YTMusic()
 
 
 def _reset_yt():
@@ -710,6 +725,63 @@ def checkpoint():
         print("WAL checkpointed — rows are visible in Database/music.db.")
     except sqlite3.Error as e:
         print(f"Checkpoint skipped (WAL stays active, data still safe): {e}")
+
+
+def _ensure_schema(conn):
+    """Creates the core tables on first run (fresh clone has no music.db yet),
+    so the project works out of the box. Idempotent via IF NOT EXISTS."""
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS Songs (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            artist TEXT,
+            album TEXT,
+            genre TEXT,
+            year INTEGER,
+            link TEXT,
+            duration DOUBLE,
+            bpm DOUBLE,
+            energy DOUBLE,
+            danceability DOUBLE,
+            valence DOUBLE,
+            acousticness DOUBLE,
+            instrumentalness DOUBLE,
+            likeability DOUBLE,
+            end_reason TEXT,
+            skipp FLOAT,
+            hook_length FLOAT,
+            replayed INTEGER,
+            liked INTEGER,
+            saved INTEGER,
+            confidence FLOAT,
+            place TEXT
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS Preprocessed (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            artist TEXT,
+            album TEXT,
+            genre TEXT,
+            year INTEGER,
+            link TEXT UNIQUE,
+            duration DOUBLE,
+            bpm DOUBLE,
+            energy DOUBLE,
+            danceability DOUBLE,
+            valence DOUBLE,
+            acousticness DOUBLE,
+            instrumentalness DOUBLE,
+            place TEXT
+        )
+        """
+    )
+
+
 def _get_conn():
     global _db_conn
     if _db_conn is None:
@@ -725,6 +797,7 @@ def _get_conn():
             conn.execute("PRAGMA journal_mode=DELETE;")
         except sqlite3.Error:
             conn.execute("PRAGMA journal_mode=WAL;")
+        _ensure_schema(conn)
         _db_conn = conn
     return _db_conn
 
@@ -931,17 +1004,26 @@ def peek_preprocessed(limit=100):
     return _db_exec(_run)
 
 
-def take_preprocessed_batch(percent=0.2, min_batch=1, n=None, place=None):
+def take_preprocessed_batch(percent=0.2, min_batch=1, n=None, place=None, genres=None):
     """Atomically pulls rows out of Preprocessed and removes them. If n is given,
-    takes up to n rows; otherwise takes percent% (min min_batch). With a place,
-    only rows of that place are taken (other places stay in the pool undriven)
-    so a place-capped run never plays another place's tracks."""
+    takes up to n rows; otherwise takes percent% (min min_batch). `place` scopes
+    the take to that place's rows (other places stay in the pool undriven);
+    `genres` scopes it to rows whose genre is in the list (ANDed when both are
+    given) so a place that dislikes EDM never plays EDM pulled from another
+    place's preprocessed pool."""
     def _run(conn):
         conn.execute("BEGIN IMMEDIATE")
         try:
             _ensure_preprocessed_place(conn)
-            where = " WHERE place = ?" if place else ""
-            params = (place,) if place else ()
+            where = ""
+            params = []
+            if place:
+                where += " WHERE place = ?"
+                params.append(place)
+            if genres:
+                marks = ",".join("?" for _ in genres)
+                where += (" AND " if where else " WHERE ") + f"genre IN ({marks})"
+                params.extend(genres)
             total = conn.execute("SELECT COUNT(*) FROM Preprocessed" + where, params).fetchone()[0]
             if total == 0:
                 conn.execute("COMMIT")
@@ -953,7 +1035,7 @@ def take_preprocessed_batch(percent=0.2, min_batch=1, n=None, place=None):
                 take = max(min_batch, int(total * percent))
             rows = conn.execute(
                 "SELECT * FROM Preprocessed" + where + " ORDER BY id ASC LIMIT ?",
-                params + (take,)
+                params + [take]
             ).fetchall()
             cols = [d[0] for d in conn.execute("SELECT * FROM Preprocessed LIMIT 0").description]
             songs = [dict(zip(cols, r)) for r in rows]
@@ -1012,16 +1094,22 @@ def purge_stale_preprocessed(place, genres):
     return _db_exec(_run)
 
 
-def preprocessed_count(place=None):
+def preprocessed_count(place=None, genres=None):
     def _run(conn):
+        where = ""
+        params = []
         if place:
-            return conn.execute("SELECT COUNT(*) FROM Preprocessed WHERE place = ?",
-                                (place,)).fetchone()[0]
-        return conn.execute("SELECT COUNT(*) FROM Preprocessed").fetchone()[0]
+            where += " WHERE place = ?"
+            params.append(place)
+        if genres:
+            marks = ",".join("?" for _ in genres)
+            where += (" AND " if where else " WHERE ") + f"genre IN ({marks})"
+            params.extend(genres)
+        return conn.execute("SELECT COUNT(*) FROM Preprocessed" + where, params).fetchone()[0]
     return _db_exec(_run)
 
 
-def recycle_played_songs(n=20, place=None):
+def recycle_played_songs(n=20, place=None, genres=None):
     """Pull scored songs back into rotation so the DJ keeps playing once the
     fresh/unplayed pool runs low. PLAYED state is the gate — not the place tag:
     places are genre bundles, so a song fetched for one place legitimately fits
@@ -1033,13 +1121,14 @@ def recycle_played_songs(n=20, place=None):
     2) Backfill: only if tier 1 can't fill n does it fall back to ALREADY-played
        songs, so replays happen only when the catalog is genuinely exhausted.
 
-    Rows must carry likeability to survive delete_unscored_songs. Empty only
-    when nothing has ever been scored in the place's genres yet, in which case
-    fresh discovery is still the only source and playback keeps waiting."""
+Rows must carry likeability to survive delete_unscored_songs. Empty only
+     when nothing has ever been scored in the place's genres yet, in which case
+     fresh discovery is still the only source and playback keeps waiting."""
+    if genres is None and place and PLACE_GENRES.get(place):
+        genres = list(PLACE_GENRES[place])
     def _run(conn):
         cols = [d[0] for d in conn.execute("SELECT * FROM Songs LIMIT 0").description]
-        if place and PLACE_GENRES.get(place):
-            genres = list(PLACE_GENRES[place])
+        if genres:
             marks = ",".join("?" for _ in genres)
             where = f"genre IN ({marks})"
             params = list(genres)

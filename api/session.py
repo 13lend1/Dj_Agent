@@ -27,7 +27,12 @@ def _start_profile(place):
     with a pool continues with the old configured values."""
     try:
         from Music.songs import preprocessed_count
-        empty = preprocessed_count(place=place) == 0
+        from Music.preference import PLACE_GENRES
+        # The deck now draws from EVERY place's preprocessed pool, but only
+        # tracks whose genre is part of this place's list, so "cold" means no
+        # songs of the place's genres are ready anywhere.
+        genres = PLACE_GENRES.get(place) if place else None
+        empty = preprocessed_count(genres=genres) == 0
     except Exception:
         empty = False
     if empty:
@@ -40,7 +45,9 @@ def _is_cold(place):
     fast-start that plays the first fetched songs raw, no model/agent)."""
     try:
         from Music.songs import preprocessed_count
-        return preprocessed_count(place=place) == 0
+        from Music.preference import PLACE_GENRES
+        genres = PLACE_GENRES.get(place) if place else None
+        return preprocessed_count(genres=genres) == 0
     except Exception:
         return False
 

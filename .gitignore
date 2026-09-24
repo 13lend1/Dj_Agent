@@ -12,3 +12,9 @@ Miniconda3-latest-Linux-x86_64.sh
 .env
 
 headers_auth.json
+music.db
+
+# Runtime-generated artifacts
+ffmpeg-errors.log
+songs.csv
+Notebooks/

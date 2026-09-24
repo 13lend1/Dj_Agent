@@ -44,6 +44,10 @@ let stallTimer = null;
 // still catch the server mid-transition (paused), so the defensive pause
 // below must not re-freeze an element that was just told to play.
 let lastResumeAt = 0;
+// Previous polled pause state: lets the status poll detect "deck was paused,
+// now it isn't" so a hotkey pause/resume in the background can unfreeze the
+// audio element even though no click ever reached the page.
+let prevPolledPaused = false;
 
 function startAudio() {
   if (audioOn) return;
@@ -289,6 +293,30 @@ function setLoading(s) {
   }
 }
 
+// The now-playing block (title / artist / meta / rating / cover / progress bar)
+// is shared by the status poll and the SKIP response: when a skip POST returns
+// after waiting for the deck to swap, it already carries the NEW song, so the
+// UI switches the same instant the audio does instead of one poll behind.
+function renderSongNow(song, playing, paused) {
+  if (song) {
+    $("np-title").textContent = song.title || "\u2014";
+    $("np-artist").textContent = song.artist || "\u2014";
+    let meta = [song.genre, song.place].filter(Boolean).join(" \u00b7 ");
+    if (song.play_start_sec != null && song.play_end_sec != null) {
+      meta += `${meta ? " \u00b7 " : ""}hook ${fmt(song.play_start_sec)}-${fmt(song.play_end_sec)}`;
+    }
+    $("np-meta").textContent = meta;
+
+    $("rate-like").className = "rate up" + (song.rating === 0 ? " active" : "");
+    $("rate-dislike").className = "rate down" + (song.rating === 1 ? " active" : "");
+    refreshCover(song);
+  } else {
+    setCoverImage(null);
+  }
+
+  updateProgress(song, !!playing, !!paused);
+}
+
 function renderStatus(s) {
   lastStatus = s;
   if (!s.dj_running) {
@@ -298,6 +326,7 @@ function renderStatus(s) {
     // that can retarget the DJ.
     if (audioOn) { audio.pause(); audioOn = false; }
     audioPaused = false;
+    prevPolledPaused = false;
     setDeviceStatus(false);
     setPauseButton(false);
     $("state-label2").textContent = "STANDBY";
@@ -329,6 +358,18 @@ function renderStatus(s) {
     audioPaused = true;
     audio.pause();
   }
+  // The reverse direction: a resume fired by the GLOBAL hotkey (or another tab)
+  // never reaches this page's keydown handler, so the poll is the only signal.
+  // If the deck just unpaused and the element is still frozen from the pause
+  // above, snap it back to the live edge — otherwise the song plays server-side
+  // while this tab stays mute forever.
+  if (!paused && prevPolledPaused && audioPaused && audioOn) {
+    audioPaused = false;
+    lastResumeAt = Date.now();
+    reconnectAudio({ fresh: true });
+    setDeviceStatus(s.playing);
+  }
+  prevPolledPaused = !!paused;
   if (!pausePending) {
     setDeviceStatus(s.playing && !paused);
     setPauseButton(paused);
@@ -351,25 +392,9 @@ function renderStatus(s) {
   $("sound-cta").hidden = !(s.playing && !audioOn);
 
   const song = s.song;
-  if (song) {
-    $("np-title").textContent = song.title || "\u2014";
-    $("np-artist").textContent = song.artist || "\u2014";
-    let meta = [song.genre, song.place].filter(Boolean).join(" \u00b7 ");
-    if (song.play_start_sec != null && song.play_end_sec != null) {
-      meta += `${meta ? " \u00b7 " : ""}hook ${fmt(song.play_start_sec)}-${fmt(song.play_end_sec)}`;
-    }
-    $("np-meta").textContent = meta;
+  renderSongNow(song, s.playing, paused || pausePending > 0);
 
-    $("rate-like").className = "rate up" + (song.rating === 0 ? " active" : "");
-    $("rate-dislike").className = "rate down" + (song.rating === 1 ? " active" : "");
-    refreshCover(song);
-  } else {
-    setCoverImage(null);
-  }
-
-  updateProgress(song, s.playing, paused || pausePending > 0);
-
-  // After updateProgress (which resets the bar for a null song), let the
+  // After renderSongNow (which resets the bar for a null song), let the
   // preparing state take over the same bar with the load-progress fill.
   setLoading(s);
 
@@ -638,6 +663,12 @@ async function act(action) {
       flash("no earlier songs yet");
     } else {
       flash(`\u2713 ${res.action || action} sent`);
+      if (action === "skip" && res && res.song && lastStatus && lastStatus.dj_running) {
+        // The skip POST waited until the deck actually swapped, so res.song is
+        // the new song measured at the same instant the audio cut. Render it
+        // NOW — otherwise the new song's audio leads the UI/bar by ~1s.
+        renderSongNow(res.song, true, lastStatus.paused || pausePending > 0);
+      }
     }
     if (RECONNECT.has(action)) {
       // Skip / previous re-anchor FORCED so the throttle can never swallow the
@@ -686,6 +717,23 @@ function wire() {
     const chip = e.target.closest(".chip");
     if (chip) { toggleGenre(chip.dataset.genre); return; }
     if (e.target.id === "sound-cta") { startAudio(); return; }
+  });
+
+  document.addEventListener("keydown", (e) => {
+    // Ctrl+Alt shortcuts: N = skip, L = like, F = play this song in full,
+    // Space = pause/resume.
+    // NOTE: a background tab can't receive keys, so this only fires when the
+    // page is focused. Run hotkeys.py to cover the background too — the
+    // server debounces the overlap so a single press never acts twice.
+    if (!(e.ctrlKey && e.altKey)) return;
+    const tag = (e.target.tagName || "").toLowerCase();
+    if (tag === "input" || tag === "textarea" || e.target.isContentEditable) return;
+    const key = (e.key || "").toLowerCase();
+    e.preventDefault();
+    if (key === "n") act("skip");
+    else if (key === "l") rate(0);
+    else if (key === "f") act("full");
+    else if (key === " " || key === "spacebar") act("pause");
   });
 }
 

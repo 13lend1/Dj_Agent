@@ -209,8 +209,16 @@ class DJ(PreloadedPlayer):
             return samples
 
     def _fetch_batch(self, n=None, small=False):
-        fresh = take_preprocessed_batch(
-            n=(n or self.pool_size), place=getattr(self, 'place', None))
+        # Borrow from EVERY place's preprocessed pool, but only tracks whose
+        # genre is part of THIS place's list: road trip may play the car's rock
+        # but never a rave's EDM. Already-played songs are barred below too.
+        pref = _places_mod()
+        genres = pref.PLACE_GENRES.get(self.place) if self.place else None
+        # Take only what this batch will actually queue (top_n), not pool_size:
+        # taking 40 to queue 15 deleted-and-discarded the other 25, draining the
+        # pool ~2.6x faster than playback consumed it and leaving nothing to play.
+        take_n = min((n or self.pool_size), self.top_n)
+        fresh = take_preprocessed_batch(n=take_n, genres=genres)
 
         # The small first batch already ran the agent fast-start, so the raw
         # trial path is no longer needed.
@@ -232,14 +240,14 @@ class DJ(PreloadedPlayer):
                       f"fresh batch (kept {len(fresh)}).")
             candidates = fresh
 
-        # Nonstop guarantee: once the pool of unplayed songs is exhausted,
-        # recycle already-played songs so the DJ keeps playing forever instead
-        # of running dry (the catalog is finite, the set must not be). Skipped
-        # for the small first batch so it stays small and agent-scoped.
+        # Nonstop guarantee: once the pool of unplayed songs is exhausted (across
+        # every place, since the take above is global), recycle already-played
+        # songs so the DJ keeps playing forever instead of running dry (the
+        # catalog is finite, the set must not be). Skipped for the small first
+        # batch so it stays small and agent-scoped.
         if not small and len(candidates) < self.top_n:
             try:
-                recycled = recycle_played_songs(
-                    n=self.pool_size, place=getattr(self, 'place', None))
+                recycled = recycle_played_songs(n=self.pool_size, genres=genres)
             except Exception as e:
                 print("Recycle lookup failed:", e)
                 recycled = []
@@ -699,6 +707,12 @@ class DJ(PreloadedPlayer):
             print("Could not find a song to preload.")
             return
 
+        if isinstance(song_info, dict):
+            # Clip any song that has no Gemini hook window (the random dry-pool
+            # fallback) BEFORE preparing, so ffmpeg seeks into its window and it
+            # can never play in full.
+            self._ensure_hook_window(song_info)
+
         if self.stop_event.is_set():
             return
 
@@ -778,7 +792,35 @@ class DJ(PreloadedPlayer):
 
     # ---- playback ---------------------------------------------------------
 
+    def _ensure_hook_window(self, song):
+        """Guarantee a clip window (play_start_sec/play_end_sec) on a song so it
+        NEVER plays in full by accident: batch songs arrive with Gemini hooks;
+        anything without one (dry-pool random fallback, holds, older rows) gets
+        the deterministic middle-section clip instead. The ONLY exception is a
+        deliberate full-play (F hotkey), which clears the window on purpose and
+        flags the song so this skips it. No-op when a window exists. Never
+        raises — a windowless song turned full is worse than any failure."""
+        if song.get('_play_full'):
+            return
+        start = song.get('play_start_sec')
+        end = song.get('play_end_sec')
+        if start is not None and end is not None:
+            return
+        try:
+            start, end = self.agent._clip_window(song, self.clip_length)
+            song['play_start_sec'] = start
+            song['play_end_sec'] = end
+            song['play_start'] = Agent._fmt(start)
+            song['play_end'] = Agent._fmt(end)
+            song['clip_length'] = round(max(0.0, end - start), 1)
+            song['hook_length'] = song['clip_length']
+        except Exception:
+            pass
+
     def _begin_song(self, song, current, start_offset=0.0):
+        start = song.get('play_start_sec')
+        end = song.get('play_end_sec')
+        self._ensure_hook_window(song)
         start = song.get('play_start_sec')
         end = song.get('play_end_sec')
         with self.lock:
@@ -1269,12 +1311,14 @@ class DJ(PreloadedPlayer):
 
                     elapsed = self.elapsed_now() or 0.0
                     start = float(song.get('play_start_sec') or 0) + max(0.0, elapsed)
-                    # Drop the hook end-cap so the track streams to its true end
-                    # (play_end_sec=None -> current_clip_duration=None -> no early
-                    # advance; the track runs to its real end).
+                    # Full-play is EXPLICIT (F key): drop the hook end-cap so the
+                    # track streams to its true end (play_end_sec=None ->
+                    # current_clip_duration=None -> no early advance), and mark it
+                    # so _begin_song's window enforcement skips re-clipping.
                     song['play_start_sec'] = None
                     song['play_end_sec'] = None
                     song['transition_out'] = None
+                    song['_play_full'] = True
                     current = self.prepare_song(song, seek_to=start)
                     self._begin_song(song, current, start_offset=max(0.0, elapsed))
                     self._holding = False
@@ -1492,19 +1536,14 @@ class DJ(PreloadedPlayer):
                         self._dry_started = None
                         self._advance_fail_count = 0
                         self._replayed_now = True
-                        effect_samples = self._load_effect(effect)
-                        if effect_samples is not None and len(effect_samples):
-                            self._play_effect_intro(current, stream, effect_samples)
                         print(f"Starting next song: {self.current_title} "
                               f"{self._fmt_hook(window_next)}", flush=True)
                         self._keep_preloaded(get_next_song)
                         continue
 
-                    # A skip is an INSTANT cut: the current song stops immediately,
-                    # the transition effect drops over the start of the next one,
-                    # and the UI's audio bar switches to the new song right away
-                    # (current_song is reassigned by _safe_advance, which is what
-                    # /api/state reports and the bar renders).
+                    # A skip is a HARD cut: the current song stops immediately
+                    # and the next one starts instantly — no crossfade, no
+                    # transition effect over its intro.
                     #
                     # No decoded next song yet (typical for the very FIRST song,
                     # whose second track is still downloading). Do NOT block the
@@ -1525,8 +1564,7 @@ class DJ(PreloadedPlayer):
                         self.skip_event.set()
                         self._keep_preloaded(get_next_song)
                     else:
-                        next_song = self._safe_advance(
-                            current, stream, 0.0, effect=effect)
+                        next_song = self._safe_advance(current, stream, 0.0)
 
                         if next_song is None:
                             self.skip_event.set()
@@ -1611,7 +1649,7 @@ class DJ(PreloadedPlayer):
                         continue
 
                 try:
-                    data = self._read_chunk(current, timeout=1.0)
+                    data = self._read_chunk(current, timeout=0.25)
                 except (OSError, ValueError):
                     data = b""
 

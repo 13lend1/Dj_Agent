@@ -14,6 +14,15 @@ Miniconda3-latest-Linux-x86_64.sh
 headers_auth.json
 music.db
 
+# Runtime-generated personal caches (song names / history / local config)
+Database/cover_cache.json
+Database/places.json
+Music/feature_cache.json
+
+# Personal per-place preference models (trained locally, never shared)
+models/*.pkl
+models/_place_meter.json
+
 # Runtime-generated artifacts
 ffmpeg-errors.log
 songs.csv

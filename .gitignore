@@ -28,3 +28,5 @@ models/_place_meter.json
 ffmpeg-errors.log
 songs.csv
 Notebooks/
+Data/
+transofrm.py

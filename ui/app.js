@@ -19,14 +19,29 @@ async function post(url, body) {
     headers: { "Content-Type": "application/json" },
     body: body ? JSON.stringify(body) : undefined,
   });
-  if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+  await checkOk(res);
   return res.json();
 }
 
 async function del(url) {
   const res = await fetch(url, { method: "DELETE" });
-  if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+  await checkOk(res);
   return res.json();
+}
+
+// Throw with the server's human-readable `detail` when there is one, so a
+// rejected request (e.g. "that place name is already taken") tells the user
+// why instead of a bare "400 Bad Request".
+async function checkOk(res) {
+  if (res.ok) return;
+  let message = `${res.status} ${res.statusText}`;
+  try {
+    const body = await res.json();
+    if (body && typeof body.detail === "string") message = body.detail;
+  } catch (_) {
+    /* non-JSON error body; keep the status line */
+  }
+  throw new Error(message);
 }
 
 const audio = $("audio");
@@ -629,11 +644,29 @@ async function gateDelete(key) {
   }
 }
 
+// Mirror of Music/preference.py `normalize_place`: lowercased, non-alphanumerics
+// collapsed to '_' then trimmed — 'Gym', 'GYM' and 'gym!' all collapse to 'gym',
+// so each is challenged against the same key. The server re-validates anyway;
+// this only avoids a round-trip for obvious duplicates.
+function placeKey(name) {
+  return (name || "").trim().toLowerCase()
+    .replace(/[^a-z0-9]+/g, "_")
+    .replace(/^_+|_+$/g, "");
+}
+
 async function gateCreate() {
   const name = $("gate-name").value.trim();
   if (!name) { $("gate-msg").textContent = "give the place a name"; return; }
+  const key = placeKey(name);
+  const clash = (placesData.places || []).find((p) => p.key === key);
+  if (clash) {
+    $("gate-msg").textContent = clash.custom
+      ? `a place named '${key}' already exists - pick another name, or delete it first to change its genres`
+      : `'${key}' is a built-in place - pick another name`;
+    return;
+  }
   if (!selectedGenres.length) { $("gate-msg").textContent = "pick at least one genre"; return; }
-  $("gate-msg").textContent = `creating '${name}'...`;
+  $("gate-msg").textContent = `creating '${key}'...`;
   setGateBusy(true);
   try {
     const res = await post(PLACE_URL, { place: name, genres: selectedGenres });

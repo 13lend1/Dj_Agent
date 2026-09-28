@@ -131,15 +131,26 @@ def custom_places():
 
 
 def add_place(name, genres):
-    """Create (or replace) a user-defined place and persist it. Returns the
-    normalized key. When the name is reused (redefining the place), the stale
-    tracked-pool rows for it are purged too so a place that changes its genres
-    never keeps playing the OLD place's tracks (e.g. 'test' was hip-hop, gets
-    re-added as pop — the leftover hip-hop catalog must not still play).
-    Raises ValueError when the name or genres are unusable."""
+    """Create a user-defined place and persist it. Returns the normalized key.
+
+    A name can only ever be used once: it must not collide with a built-in place
+    (e.g. 'gym', which ships with the app) nor with another user-created place.
+    Both are tested AFTER normalize_place, so 'Gym', 'GYM' and 'gym!' are all
+    rejected exactly like 'gym' — otherwise a place could be created under a name
+    that silently shadows a built-in and inherits its songs/model/history. To
+    change an existing place, delete it first and re-create it.
+
+    Raises ValueError when the name is unusable or already taken, or when the
+    genres are empty."""
     key = normalize_place(name)
     if not key:
         raise ValueError("a place name is required")
+    if key in _CUSTOM_PLACES:
+        raise ValueError(
+            f"a place named '{key}' already exists - pick another name, or "
+            f"delete it first if you want to change its genres")
+    if key in PLACE_GENRES:
+        raise ValueError(f"'{key}' is a built-in place - pick another name")
     clean = []
     for genre in genres or []:
         genre = str(genre).strip().lower()
@@ -153,12 +164,12 @@ def add_place(name, genres):
     data = _read_places_file()
     data["places"] = dict(_CUSTOM_PLACES)
     _write_places_file(data)
-    # Always purge (no-op when nothing is stale). This MUST NOT be gated on the
-    # key being in memory right now: the stale Preprocessed rows tagged with
-    # this place name survive in the DB even after places.json is deleted and
-    # the key drops out of PLACE_GENRES. Re-adding "test" as pop after it was
-    # hip-hop must never keep serving the leftover hip-hop rows just because
-    # the key wasn't in PLACE_GENRES at add time — so purge unconditionally.
+    # Safety net for a name that is being (re)created after its old definition
+    # was lost WITHOUT delete_place running — e.g. places.json was removed or
+    # hand-edited, so the key dropped out of PLACE_GENRES but its Preprocessed
+    # rows stayed in the DB tagged with the same name. A fresh "test" as pop must
+    # not go on serving the leftover hip-hop rows, so purge unconditionally. A
+    # normal first-time create is a no-op here (no rows for that key yet).
     _purge_stale_tracked(key, clean)
     return key
 

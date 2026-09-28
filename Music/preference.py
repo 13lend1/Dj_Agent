@@ -179,6 +179,64 @@ def _purge_stale_tracked(place, genres):
               f"'{place}':", e)
 
 
+def delete_place(name):
+    """Delete a user-created place: its definition, its songs and its model.
+
+    Returns a summary dict of what was removed. Raises ValueError when the
+    place cannot be deleted — unknown, or a built-in. Built-ins are the
+    PLACE_GENRES keys that are not in _CUSTOM_PLACES; they ship with the app and
+    deleting one would strand the pool rows already tagged with it.
+
+    The active pointer is cleared when it pointed at the deleted place, because
+    get_active_place() does not validate against PLACE_GENRES: leaving it
+    dangling would make the next DJ start treat an unknown place as "no genre
+    filter" and quietly play every genre.
+    """
+    key = normalize_place(name)
+    if not key:
+        raise ValueError("a place name is required")
+    if key not in _CUSTOM_PLACES:
+        if key in PLACE_GENRES:
+            raise ValueError(f"'{key}' is a built-in place and cannot be deleted")
+        raise ValueError(f"unknown place '{name}'")
+
+    genres = list(_CUSTOM_PLACES.get(key) or [])
+
+    # Drop the definition first so a failure below can never leave a place that
+    # the UI still lists as deletable with nothing behind it.
+    _CUSTOM_PLACES.pop(key, None)
+    PLACE_GENRES.pop(key, None)
+
+    data = _read_places_file()
+    data["places"] = dict(_CUSTOM_PLACES)
+    cleared_active = normalize_place(data.get("active")) == key
+    if cleared_active:
+        data["active"] = None
+    _write_places_file(data)
+
+    # Songs/pool/history and the model are keyed by the place string, so they are
+    # purged even for a name that has already dropped out of the registry.
+    removed = {"songs": 0, "preprocessed": 0, "agent": 0, "model": False}
+    try:
+        from Music.songs import delete_place_songs
+        removed.update(delete_place_songs(key))
+    except Exception as e:
+        print(f"Could not delete songs for '{key}':", e)
+    try:
+        from Model.linear_regression import delete_place_model
+        removed["model"] = bool(delete_place_model(key))
+    except Exception as e:
+        print(f"Could not delete model for '{key}':", e)
+
+    print(f"Deleted place '{key}' ({', '.join(genres) or 'no genres'}): "
+          f"{removed['songs']} song(s), {removed['preprocessed']} pool row(s), "
+          f"{removed['agent']} run(s), model "
+          f"{'removed' if removed['model'] else 'not present'}.",
+          flush=True)
+    return {"place": key, "genres": genres, "cleared_active": cleared_active,
+            **removed}
+
+
 def get_active_place():
     """The place the user last selected. Returns None when they never chose one;
     returns "" when they explicitly chose 'any place'."""

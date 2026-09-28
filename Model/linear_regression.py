@@ -96,6 +96,37 @@ def load_place_model(place):
     return LinearRegressionModel.load(place)
 
 
+def delete_place_model(place):
+    """Removes a place's model: the pickle and its _place_meter.json entry.
+
+    Both halves matter. A stale pickle would be happily reloaded by
+    ensure_place_model() if the same place name is ever created again, and a
+    leftover meter entry would make a future model look "already trained on N
+    records" and suppress the retrain. Returns True when something was deleted.
+    """
+    if not place:
+        return False
+    key = (place or "").strip().lower()
+    removed = False
+
+    path = place_model_path(place)
+    try:
+        os.remove(path)
+        removed = True
+        print(f"[model] Deleted model {path}", flush=True)
+    except FileNotFoundError:
+        pass
+    except OSError as exc:
+        print(f"[model] Could not delete {path}: {exc}", flush=True)
+
+    meta = _load_meta()
+    if key in meta:
+        meta.pop(key, None)
+        _save_meta(meta)
+        removed = True
+    return removed
+
+
 def ensure_place_model(place):
     """Returns the best currently-available fitted model for a place, or None
     when no model exists yet (fewer than MIN_SAMPLES scored records — callers

@@ -827,6 +827,18 @@ body.gated .page {
   margin-bottom: 20px;
 }
 
+/* The tile is a positioned wrapper so the start control and the delete button
+   can be siblings inside it (a <button> cannot contain a <button>). */
+.gate-tile {
+  position: relative;
+  display: flex;
+}
+
+.gate-tile .gate-place {
+  flex: 1;
+  min-width: 0;
+}
+
 .gate-place {
   text-align: left;
   border: 1px solid var(--border);
@@ -852,6 +864,13 @@ body.gated .page {
 
 .gate-place:disabled { opacity: 0.5; cursor: default; }
 
+/* Keyboard focus on the role="button" tile: the UA outline is suppressed by the
+   generic button skin, so draw the ring explicitly. */
+.gate-place:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
 .gate-place .gp-name {
   font-family: var(--mono);
   font-size: 17px;
@@ -865,11 +884,40 @@ body.gated .page {
   color: var(--muted);
 }
 
+/* Leave room for the delete button in the top-right corner. */
+.gate-tile .gate-place { padding-right: 34px; }
+
+.gate-tile .gp-delete {
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  width: 26px;
+  height: 26px;
+  padding: 0;
+  border: 1px solid transparent;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--muted);
+  font-size: 19px;
+  line-height: 1;
+  cursor: pointer;
+  transition: color 0.2s ease, background 0.2s ease, border-color 0.2s ease;
+}
+
+.gate-tile .gp-delete:hover:not(:disabled) {
+  color: #ff8a80;
+  background: rgba(255, 138, 128, 0.12);
+  border-color: rgba(255, 138, 128, 0.4);
+}
+
+.gate-tile .gp-delete:disabled { opacity: 0.5; cursor: default; }
+
 .gate-place.gp-custom .gp-name::after {
   content: " \00b7 custom";
   color: var(--accent2);
   font-size: 11px;
 }
+
 
 .gate-create {
   border-top: 1px solid #3a3f45;
@@ -1219,6 +1267,9 @@ body.gated .page {
     padding: 10px 12px;
     font-size: 14px;
   }
+
+  /* Keep the right padding that clears the delete button. */
+  .gate-tile .gate-place { padding-right: 32px; }
 
   .toast {
     left: 10px;

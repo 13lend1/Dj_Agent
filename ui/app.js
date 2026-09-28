@@ -23,6 +23,12 @@ async function post(url, body) {
   return res.json();
 }
 
+async function del(url) {
+  const res = await fetch(url, { method: "DELETE" });
+  if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+  return res.json();
+}
+
 const audio = $("audio");
 let audioOn = false;
 // The deck is paused (either the user clicked pause or a poll reported the
@@ -481,11 +487,26 @@ function buildGatePlaces() {
   const wrap = $("gate-places");
   if (!wrap) return;
   const places = placesData.places || [];
+  // Keys and genre names come from the places registry and user input, so they
+  // are escaped before being interpolated into innerHTML.
+  const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => (
+    { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]
+  ));
+  // The start control is a <div role="button"> rather than a <button> so the
+  // delete button can sit inside the same tile — nesting a <button> in a
+  // <button> is invalid HTML and the browser hoists it out, breaking the grid.
   wrap.innerHTML = places.map((p) =>
-    `<button type="button" class="gate-place${p.custom ? " gp-custom" : ""}"` +
-    ` data-place="${p.key}">` +
-    `<span class="gp-name">${labelForPlace(p.key)}</span>` +
-    `<span class="gp-genres">${(p.genres || []).join(", ")}</span></button>`
+    `<div class="gate-tile${p.custom ? " gp-custom" : ""}">` +
+    `<div class="gate-place" role="button" tabindex="0"` +
+    ` data-place="${esc(p.key)}">` +
+    `<span class="gp-name">${esc(labelForPlace(p.key))}</span>` +
+    `<span class="gp-genres">${esc((p.genres || []).join(", "))}</span></div>` +
+    (p.custom
+      ? `<button type="button" class="gp-delete" data-place="${esc(p.key)}"` +
+        ` aria-label="Delete ${esc(labelForPlace(p.key))}"` +
+        ` title="Delete this place and all its songs">&times;</button>`
+      : "") +
+    `</div>`
   ).join("") || `<p class="place-hint">No places available.</p>`;
   setGateBusy(false);
 }
@@ -574,6 +595,35 @@ async function gateStart(key) {
   } catch (e) {
     $("gate-msg").textContent = `could not start: ${e.message}`;
     await refreshPlaces();
+  } finally {
+    setGateBusy(false);
+  }
+}
+
+async function gateDelete(key) {
+  // This is destructive and irreversible: the place, its songs, its pool and
+  // its trained model all go. Confirm before sending it.
+  const name = labelForPlace(key);
+  if (!window.confirm(
+    `Delete "${name}"?\n\nThis also permanently deletes every song in it ` +
+    `and its trained model. This cannot be undone.`
+  )) {
+    return;
+  }
+  $("gate-msg").textContent = `deleting ${name}...`;
+  setGateBusy(true);
+  try {
+    const res = await del(`${PLACE_URL}?place=${encodeURIComponent(key)}`);
+    const n = (res.songs || 0) + (res.preprocessed || 0);
+    flash(`\u{1F5D1} deleted ${name}`);
+    $("gate-msg").textContent =
+      `deleted ${name} \u2014 ${res.songs || 0} song(s), ` +
+      `${res.preprocessed || 0} pool row(s)` +
+      (res.model ? ", model removed" : "");
+    if (placesData.active === key) placesData.active = null;
+    await refreshPlaces();
+  } catch (e) {
+    $("gate-msg").textContent = `delete failed: ${e.message}`;
   } finally {
     setGateBusy(false);
   }
@@ -712,6 +762,11 @@ function wire() {
     if (e.target.id === "rate-like") { rate(0); return; }
     if (e.target.id === "rate-dislike") { rate(1); return; }
     if (e.target.id === "gate-create-btn") { gateCreate(); return; }
+    // Delete is checked before start: it is a sibling of .gate-place, not a
+    // child, so closest() would not shadow it — but keeping it first makes the
+    // precedence obvious if the markup is ever changed.
+    const delBtn = e.target.closest(".gp-delete");
+    if (delBtn) { gateDelete(delBtn.dataset.place); return; }
     const placeBtn = e.target.closest(".gate-place");
     if (placeBtn) { gateStart(placeBtn.dataset.place); return; }
     const chip = e.target.closest(".chip");
@@ -720,6 +775,14 @@ function wire() {
   });
 
   document.addEventListener("keydown", (e) => {
+    // Enter/Space on the focused place tile starts it, so the tile is usable
+    // from the keyboard now that it is a role="button" div.
+    if ((e.key === "Enter" || e.key === " ") && e.target.classList
+        && e.target.classList.contains("gate-place")) {
+      e.preventDefault();
+      gateStart(e.target.dataset.place);
+      return;
+    }
     // Ctrl+Alt shortcuts: N = skip, L = like, F = play this song in full,
     // Space = pause/resume.
     // NOTE: a background tab can't receive keys, so this only fires when the

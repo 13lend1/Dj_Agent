@@ -13,18 +13,27 @@ from api import state
 
 _start_lock = threading.Lock()
 
-# A place with nothing preprocessed yet must reach its first track fast: the
-# batch worker's first-batch threshold is max(top_n, 3), so a cold place with
-# the default top_n=15 waits for 15 freshly-discovered songs. Cap that at
-# _FAST_START_TOP_N so a songless place starts as soon as ~8 are ready.
-# Places that already have a pool keep the configured profile (default 40/15).
-_FAST_START_TOP_N = 8
+# How many songs the click that picks a place should queue straight away.
+#
+# The first batch is the only part of startup that skips the slow pipeline
+# (pool fill -> model retrain -> hook resolution -> Gemini ordering), so it is
+# the buffer that decides whether the deck keeps playing or stalls waiting for
+# the second batch. Too small and the user hears two songs and then silence
+# while the AI path catches up; too large and a cold place sits waiting for
+# candidates to be discovered before it can start at all. Sized to cover a few
+# minutes of playback.
+FIRST_BATCH_N = 8
 
 
 def _start_profile(place):
-    """Pick (pool_size, top_n) for a fresh DJ based on whether `place` already
-    has preprocessed songs. A cold place gets the fast-start top_n; any place
-    with a pool continues with the old configured values."""
+    """Pick (pool_size, top_n, first_batch_n) for a fresh DJ.
+
+    Nothing is pre-warmed: the fill happens on demand, targeted at the place that
+    was just clicked. A cold place (no songs of its genres preprocessed anywhere)
+    gets a smaller top_n so the normal batches are quick to build, but the same
+    first-batch burst, because starting on time matters more there than anywhere
+    else. Any place with a pool continues with the configured values.
+    """
     try:
         from Music.songs import preprocessed_count
         from Music.preference import PLACE_GENRES
@@ -36,8 +45,8 @@ def _start_profile(place):
     except Exception:
         empty = False
     if empty:
-        return state.pool_size, min(state.top_n, _FAST_START_TOP_N)
-    return state.pool_size, state.top_n
+        return state.pool_size, min(state.top_n, FIRST_BATCH_N), FIRST_BATCH_N
+    return state.pool_size, state.top_n, FIRST_BATCH_N
 
 
 def _is_cold(place):
@@ -89,9 +98,9 @@ def start(place=None):
                 from Music.streamsink import StreamSink
 
                 sink = StreamSink()
-            pool_size, top_n = _start_profile(place)
+            pool_size, top_n, first_batch_n = _start_profile(place)
             dj = DJ(pool_size=pool_size, top_n=top_n, resume_place=place,
-                    trial=_is_cold(place))
+                    trial=_is_cold(place), first_batch_n=first_batch_n)
         except Exception as exc:
             raise RuntimeError(f"could not start the DJ: {exc}")
         state.sink = sink

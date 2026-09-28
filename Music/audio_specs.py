@@ -5,11 +5,24 @@ import os
 import re
 import threading
 import time
+import atexit
 
 
 _FEATURE_CACHE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "feature_cache.json")
 _CACHE_LOCK = threading.Lock()
 _FEATURE_CACHE = None
+# The cache is a single growing JSON document (megabytes once the catalog fills
+# up), and rewriting it whole under _CACHE_LOCK cost ~170ms per song — paid once
+# per newly-fetched song, serialized against every other thread, so a fast pool
+# fill spent most of its time writing JSON instead of finding songs. Writes are
+# therefore deferred: mark it dirty here and let _flush_cache() put it to disk in
+# batches (and on shutdown), exactly like Music/heatmap.py's cache.
+_CACHE_DIRTY = False
+_CACHE_WRITES = 0
+# Flush after this many new entries, or this many seconds, whichever comes first.
+CACHE_FLUSH_EVERY = 25
+CACHE_FLUSH_SEC = 30.0
+_CACHE_DIRTY_AT = 0.0
 
 _RATE_LOCK = threading.Lock()
 _LAST_API_CALL = 0.0
@@ -117,6 +130,43 @@ def _persist_cache():
         print(f"Feature cache save error: {e}")
 
 
+def _mark_dirty():
+    """Record a pending cache write. Caller must hold _CACHE_LOCK."""
+    global _CACHE_DIRTY, _CACHE_DIRTY_AT
+    _CACHE_DIRTY = True
+    if not _CACHE_DIRTY_AT:
+        _CACHE_DIRTY_AT = time.time()
+
+
+def _flush_locked():
+    """Write the cache if dirty. Caller must hold _CACHE_LOCK (it is not
+    reentrant, so this is separated from _flush_cache for the lookup path,
+    which is already holding it)."""
+    global _CACHE_DIRTY, _CACHE_WRITES, _CACHE_DIRTY_AT
+    if not _CACHE_DIRTY or _FEATURE_CACHE is None:
+        return False
+    _persist_cache()
+    _CACHE_DIRTY = False
+    _CACHE_WRITES = 0
+    _CACHE_DIRTY_AT = 0.0
+    return True
+
+
+def _flush_cache(force=True):
+    """Write the cache to disk if it is dirty (and due), then clear the flag.
+
+    Called with force=False from the lookup path so a burst of songs pays for at
+    most one write per CACHE_FLUSH_EVERY entries instead of one per song.
+    """
+    with _CACHE_LOCK:
+        if not force and _CACHE_DIRTY:
+            due = (_CACHE_WRITES >= CACHE_FLUSH_EVERY
+                   or (time.time() - _CACHE_DIRTY_AT) >= CACHE_FLUSH_SEC)
+            if not due:
+                return False
+        return _flush_locked()
+
+
 def _lookup(song_name, with_artist, artist_name=None):
     key = _cache_norm(f"{song_name}|{artist_name}" if with_artist else song_name)
     _load_cache()
@@ -132,12 +182,18 @@ def _lookup(song_name, with_artist, artist_name=None):
         # A rate limit is NOT a "song not found" — do NOT bake it into the cache
         return None
 
+    global _CACHE_WRITES
     with _CACHE_LOCK:
         if feats is not None:
             _FEATURE_CACHE[key] = feats
         else:
             _FEATURE_CACHE[key] = {"_miss": True}
-        _persist_cache()
+        _CACHE_WRITES += 1
+        _mark_dirty()
+        # Already holding _CACHE_LOCK here, so use the _locked variant.
+        if (_CACHE_WRITES >= CACHE_FLUSH_EVERY
+                or (time.time() - _CACHE_DIRTY_AT) >= CACHE_FLUSH_SEC):
+            _flush_locked()
     return feats
 
 
@@ -150,6 +206,21 @@ def get_features_cached(song_name, artist_name=None):
     if feats is None and artist_name:
         feats = _lookup(song_name, False)
     return feats
+
+
+def flush_cache():
+    """Write any pending feature-cache entries to disk now.
+
+    Cache writes are batched (see _flush_cache) so a fast fill is not dominated
+    by JSON serialization, which means callers that care about durability — the
+    end of a pool fill, and process exit — should force a flush.
+    """
+    return _flush_cache(force=True)
+
+
+# Last line of defence: never lose a batch of freshly fetched features just
+# because the process ended between two batched writes.
+atexit.register(flush_cache)
 
 
 def search_reccobeats(song_name, artist_name=None):

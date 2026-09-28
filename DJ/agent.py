@@ -79,8 +79,6 @@ _QUEUE_SCHEMA = {
                 "type": "object",
                 "properties": {
                     "id": {"type": "string"},
-                    "hook_start_sec": {"type": "number"},
-                    "hook_end_sec": {"type": "number"},
                     # "clip_length_sec": {"type": "number"},
                     "transition_type": {
                         "type": "string",
@@ -93,7 +91,7 @@ _QUEUE_SCHEMA = {
                         "enum": _EFFECT_ENUM,
                     },
                 },
-                "required": ["id", "hook_start_sec", "hook_end_sec"],
+                "required": ["id"],
             },
         }
     },
@@ -102,24 +100,6 @@ _QUEUE_SCHEMA = {
 _EFFECT_NAMES = set(
     _QUEUE_SCHEMA["properties"]["queue"]["items"]["properties"]["effect"]["enum"]
 )
-_HOOK_SCHEMA = {
-    "type": "object",
-    "properties": {
-        "hooks": {
-            "type": "array",
-            "items": {
-                "type": "object",
-                "properties": {
-                    "id": {"type": "string"},
-                    "hook_start_sec": {"type": "number"},
-                    "hook_end_sec": {"type": "number"},
-                },
-                "required": ["id", "hook_start_sec", "hook_end_sec"],
-            },
-        }
-    },
-    "required": ["hooks"],
-}
 
 
 def _norm_sid(value):
@@ -131,12 +111,15 @@ class Agent:
     AI DJ agent.
     Responsibilities
     ----------------
-    1. Gemini orders candidate songs.
-    2. Gemini chooses the best hook/window for every song.
-    3. Gemini chooses the transition between every consecutive song.
-    4. Python validates all timestamps.
-    5. Python calculates clip_length.
-    6. Python guarantees a transition exists between every pair.
+    1. Python finds every song's hook from its YouTube replay heatmap
+       (Music/heatmap.py) — real audience data, not a guess.
+    2. Songs with no heatmap get a second opinion from a separate, hook-only
+       Gemini request (Music/gemini_hooks.py).
+    3. Anything still unanswered falls back to the song's middle section.
+    4. Gemini orders candidate songs.
+    5. Gemini chooses the transition between every consecutive song.
+    6. Python validates all timestamps.
+    7. Python guarantees a transition exists between every pair.
     The class is safe to import from another module:
         from agent import Agent
         agent = Agent()
@@ -152,6 +135,7 @@ class Agent:
         name
         artist
         duration
+        link
     Recommended:
         genre
         bpm
@@ -160,7 +144,6 @@ class Agent:
         valence
         acousticness
         instrumentalness
-        link
     Duration is expected to be milliseconds, matching the database structure
     used by the DJ project.
     """
@@ -200,7 +183,7 @@ class Agent:
             return []
         by_id = {str(song.get("id")): song for song in songs}
         try:
-            queue = self._query_gemini(songs=songs, previous=previous)
+            queue = self._query_gemini(songs=songs, previous=previous, hooks={})
         except Exception as exc:
             print(
                 f"[Agent] Gemini ordering failed, " f"returning original order: {exc}"
@@ -225,9 +208,11 @@ class Agent:
     def build_playlist(self, songs, current=None, clip_length=33, place=None):
         """
         Build the complete AI-DJ playlist.
+        Python decides:
+            - every song's hook, from its YouTube replay heatmap, then from a
+              separate hook-only Gemini request, then from the middle section
         Gemini decides:
             - song order
-            - hook/best section
             - transition between songs
         Python guarantees:
             - valid timestamps
@@ -241,9 +226,9 @@ class Agent:
         current:
             Currently playing song. If omitted, self._last is used.
         clip_length:
-            Fallback clip length in seconds, used only when Gemini does
-            not return a clip_length_sec for a song or returns no valid
-            hook (default 33).
+            Target hook length in seconds. A heatmap window decides its own
+            length within a band around this number; only the middle-section
+            fallback is exactly this long (default 33).
         place:
             Active place key (e.g. "home"). When given it is stored as the
             run's single place key in the Agent table; otherwise the place is
@@ -257,6 +242,7 @@ class Agent:
             play_start
             play_end
             clip_length
+            hook_source ("yt_heatmap", "gemini" or "middle_section")
             transition_out
         Example:
             {
@@ -268,6 +254,7 @@ class Agent:
                 "play_start": "1:22",
                 "play_end": "1:55",
                 "clip_length": 33.0,
+                "hook_source": "yt_heatmap",
                 "transition_out": {
                     "type": "beatmatched_crossfade",
                     "crossfade_sec": 4.0,
@@ -288,11 +275,13 @@ class Agent:
             clip_length = 33.0
         clip_length = max(1.0, clip_length)
 
+        hooks = self._resolve_heatmap_hooks(songs, clip_length)
+        hooks.update(self._resolve_gemini_hooks(songs, hooks, clip_length))
 
         by_id = {_norm_sid(song.get("id")): song for song in songs}
         try:
             queue = self._query_gemini(
-                songs=songs, previous=previous
+                songs=songs, previous=previous, hooks=hooks
             )
         except Exception as exc:
             print(
@@ -314,100 +303,109 @@ class Agent:
             ordered_entries.append(entry)
         missing_songs = [song for song in songs
                          if _norm_sid(song.get("id")) not in used_ids]
-
-        # Gemini sometimes skips the hook fields (null / zero-length / out of
-        # range) even though the schema asks for them. Collect every song that
-        # ended up without a usable hook and ask Gemini once more, ONLY for
-        # windows. Whatever it is still unsure about falls back to the middle
-        # section, exactly as before.
-        repair_needed = []
-        for entry in ordered_entries:
-            song = self._validate(dict(by_id[_norm_sid(entry.get("id"))]))
-            _, _, fallback = self._resolve_hook(
-                song=song, entry=entry, clip_length=clip_length
-            )
-            if fallback:
-                repair_needed.append(song)
-        for original_song in missing_songs:
-            repair_needed.append(self._validate(dict(original_song)))
-        repairs = self._request_hooks(repair_needed) if repair_needed else {}
-        if len(repairs):
-            print(
-                f"[Agent] Gemini hook repair recovered real hooks for "
-                f"{len(repairs)} song(s)."
-            )
-
-        def _fused_entry(entry, song_id):
-            """Prefer the repaired window over the original Gemini window."""
-            fused = dict(entry)
-            window = repairs.get(song_id)
-            if window:
-                fused["hook_start_sec"] = window["hook_start_sec"]
-                fused["hook_end_sec"] = window["hook_end_sec"]
-            return fused
+        if missing_songs and queue:
+            print(f"[Agent] Gemini omitted {len(missing_songs)} song(s); "
+                  "appending them.")
 
         playlist = []
-        fallback_count = 0
-        for entry in ordered_entries:
-            song_id = _norm_sid(entry.get("id"))
-            song = self._validate(dict(by_id[song_id]))
-            fused = _fused_entry(entry, song_id)
-            start, end, fallback = self._resolve_hook(
-                song=song, entry=fused, clip_length=clip_length
+        counts = {"yt_heatmap": 0, "gemini": 0, "middle_section": 0}
+        play_order = ([(by_id[_norm_sid(entry.get("id"))], entry)
+                       for entry in ordered_entries]
+                      + [(song, None) for song in missing_songs])
+        for original_song, entry in play_order:
+            song = self._validate(dict(original_song))
+            song_id = _norm_sid(song.get("id"))
+            start, end, source = self._resolve_hook(
+                song=song, hook=hooks.get(song_id), clip_length=clip_length
             )
-            if fallback:
-                fallback_count += 1
+            self._apply_window(song, start, end, source)
+            counts[source] = counts.get(source, 0) + 1
+            hook = hooks.get(song_id)
+            if source == "yt_heatmap" and hook:
+                song["replay_peak_sec"] = hook.get("replay_peak_sec")
+                song["replay_score"] = hook.get("replay_score")
+            if source == "middle_section":
                 self._print_fallback(song, clip_length)
-            song["play_start_sec"] = start
-            song["play_end_sec"] = end
-            song["play_start"] = self._fmt(start)
-            song["play_end"] = self._fmt(end)
-            song["clip_length"] = round(max(0.0, end - start), 1)
-            song["hook_length"] = round(max(0.0, end - start), 1)
-            song["_gemini_transition"] = {
+            song["_gemini_transition"] = ({
                 "type": entry.get("transition_type"),
                 "crossfade_bars": entry.get("crossfade_bars"),
                 "note": entry.get("transition_note"),
                 "effect": entry.get("effect") or "none",
-            }
+            } if entry else None)
             playlist.append(song)
-        if missing_songs:
-            if queue:
-                print(
-                    f"[Agent] Gemini omitted "
-                    f"{len(missing_songs)} song(s); "
-                    "appending them."
-                )
-            for original_song in missing_songs:
-                song = self._validate(dict(original_song))
-                fused = repairs.get(_norm_sid(song.get("id")))
-                if fused:
-                    start, end, fallback = self._resolve_hook(
-                        song=song, entry=fused, clip_length=clip_length
-                    )
-                else:
-                    start, end = self._clip_window(song, clip_length)
-                    fallback = True
-                if fallback:
-                    fallback_count += 1
-                    self._print_fallback(song, clip_length)
-                song["play_start_sec"] = start
-                song["play_end_sec"] = end
-                song["play_start"] = self._fmt(start)
-                song["play_end"] = self._fmt(end)
-                song["clip_length"] = round(max(0.0, end - start), 1)
-                song["hook_length"] = round(max(0.0, end - start), 1)
-                song["_gemini_transition"] = None
-                playlist.append(song)
-        if fallback_count:
+        total = len(playlist)
+        if counts["middle_section"]:
             print(
-                f"[hooks] {len(playlist) - fallback_count}/{len(playlist)} used "
-                f"Gemini hooks; {fallback_count}/{len(playlist)} fell back to the "
-                f"{clip_length:.1f}s fallback."
+                f"[hooks] {counts['yt_heatmap']}/{total} hooks from the YouTube "
+                f"replay heatmap, {counts['gemini']}/{total} from Gemini, "
+                f"{counts['middle_section']}/{total} fell back to the "
+                f"{clip_length:.1f}s middle section."
             )
         self._finalize_transitions(playlist, previous=previous)
         self._save_response(playlist, place=place)
         return playlist
+
+    def _resolve_heatmap_hooks(self, songs, clip_length):
+        """Every song's hook, taken from its YouTube replay heatmap.
+
+        This is the real audience signal — the seconds people scrub back to —
+        so it replaces Gemini guessing a chorus out of a song title. Songs whose
+        video publishes no heatmap (YouTube has none for a lot of long-tail
+        videos) are simply missing from the result and go on to the Gemini
+        second opinion. A heatmap problem must never break playlist generation,
+        so any failure here yields an empty mapping.
+        """
+        try:
+            from Music.heatmap import resolve_hooks
+        except ImportError:
+            from heatmap import resolve_hooks
+        try:
+            return resolve_hooks(songs, clip_length=clip_length)
+        except Exception as exc:
+            print(f"[Agent] Heatmap lookup failed ({exc}); "
+                  "asking Gemini for those hooks instead.")
+            return {}
+
+    def _resolve_gemini_hooks(self, songs, heatmap_hooks, clip_length):
+        """Second opinion for the songs no YouTube heatmap could cover.
+
+        This is a separate, hook-only Gemini request (Music/gemini_hooks.py) with
+        no playlist and no transitions in it, so it stays out of the agent's
+        ordering call and only runs when measured data is missing. Whatever it
+        still cannot answer falls back to the deterministic middle section.
+        """
+        missing = [song for song in songs
+                   if _norm_sid(song.get("id")) not in (heatmap_hooks or {})]
+        if not missing:
+            return {}
+        try:
+            from Music.gemini_hooks import request_hooks
+        except ImportError:
+            try:
+                from gemini_hooks import request_hooks
+            except ImportError:
+                print("[hooks] Gemini hook module unavailable; using fallbacks.")
+                return {}
+        try:
+            found = request_hooks(missing)
+        except Exception as exc:
+            print(f"[hooks] Gemini hook lookup failed ({exc}); using fallbacks.")
+            return {}
+        if found:
+            print(f"[hooks] No heatmap for {len(missing)} song(s); Gemini "
+                  f"supplied {len(found)} hook(s) instead.")
+        return found or {}
+
+    def _apply_window(self, song, start, end, source):
+        """Copy a resolved hook window onto a song, with its provenance, so it
+        reaches the player, the database and the saved Agent run."""
+        song["play_start_sec"] = start
+        song["play_end_sec"] = end
+        song["play_start"] = self._fmt(start)
+        song["play_end"] = self._fmt(end)
+        song["clip_length"] = round(max(0.0, end - start), 1)
+        song["hook_length"] = round(max(0.0, end - start), 1)
+        song["hook_source"] = source
     def _save_response(self, playlist, place=None):
         """Persist every completed agent response to the Agent table.
 
@@ -426,25 +424,26 @@ class Agent:
                 print(f"[Agent] Saved response {run_id} ({len(playlist)} songs).")
         except Exception as exc:
             print(f"[Agent] Could not save response: {exc}")
-    def _query_gemini(self, songs, previous):
+    def _query_gemini(self, songs, previous, hooks=None):
         """
         Make exactly one Gemini request.
         Gemini returns:
             queue[
                 {
                     id,
-                    hook_start_sec,
-                    hook_end_sec,
                     transition_type,
                     crossfade_bars,
                     transition_note,
                     effect
                 }
             ]
+        `hooks` is the heatmap window already resolved for each song. It is
+        handed to Gemini as context for the ordering, not as something to
+        return: the hook is measured, not chosen.
         """
         _gemini_throttle()
         prompt = self._build_prompt(
-            songs=songs, previous=previous
+            songs=songs, previous=previous, hooks=hooks or {}
         )
         last_exc = None
         for attempt in range(5):
@@ -489,106 +488,8 @@ class Agent:
                           f"(attempt {attempt + 2}/5)...")
                     time.sleep(delay)
         raise last_exc
-    def _request_hooks(self, songs):
-        """Targeted follow-up request for songs whose first-pass hook was
-        missing or unusable.
-
-        The main request orders songs AND picks hooks AND picks transitions in
-        one shot; structured output sometimes satisfies 'required' by emitting
-        null/zero windows instead of a real section. This second request asks
-        for ONLY the hook window of EVERY listed song (no ordering, no
-        transitions), which is far easier for the model to answer completely.
-
-        Returns {id: {"hook_start_sec": float, "hook_end_sec": float}} for the
-        songs Gemini answered with a valid in-range window, else {}.
-        """
-        if not songs:
-            return {}
-        _gemini_throttle()
-        prompt = self._build_hook_prompt(songs)
-        last_exc = None
-        for attempt in range(4):
-            try:
-                chat = self._client.chats.create(
-                    model=self._model,
-                    config=types.GenerateContentConfig(
-                        response_mime_type="application/json",
-                        response_schema=_HOOK_SCHEMA,
-                        temperature=0.2,
-                    ),
-                )
-                response = _gemini_request(
-                    lambda: chat.send_message(prompt), GEMINI_REQUEST_TIMEOUT
-                )
-                if response is None or not response.text:
-                    last_exc = GeminiEmptyResponse(
-                        "Gemini returned no data for the hook repair."
-                    )
-                    if attempt == 0:
-                        print(
-                            "[Gemini] Hook repair returned empty; retrying in 15s..."
-                        )
-                        time.sleep(15.0)
-                    continue
-                data = json.loads(response.text)
-                hooks = data.get("hooks") or []
-                windows = {}
-                for entry in hooks:
-                    song_id = _norm_sid(entry.get("id"))
-                    if not song_id:
-                        continue
-                    try:
-                        start = float(entry.get("hook_start_sec"))
-                        end = float(entry.get("hook_end_sec"))
-                    except (TypeError, ValueError):
-                        continue
-                    if start < 0 or end <= start:
-                        continue
-                    windows[song_id] = {
-                        "hook_start_sec": start,
-                        "hook_end_sec": end,
-                    }
-                return windows
-            except Exception as exc:
-                last_exc = exc
-                if attempt < 3:
-                    print(
-                        f"[Gemini] Hook repair failed ({exc}); retrying in 15s..."
-                    )
-                    time.sleep(15.0)
-        # The repair is best-effort: never let it kill playlist generation.
-        print(f"[Gemini] Hook repair gave up ({last_exc}); using fallbacks.")
-        return {}
-    def _build_hook_prompt(self, songs):
-        lines = []
-        lines.append("Return hook_start_sec/hook_end_sec for EVERY song below.")
-        lines.append("")
-        lines.append(
-            "These songs ALREADY belong together in one set — do not order "
-            "them, do not add transitions, ONLY give each one its strongest "
-            "playable window."
-        )
-        lines.append("")
-        lines.append(
-            "Rules: hook_start_sec/hook_end_sec must both be numbers INSIDE "
-            "the song's duration, hook_end_sec strictly greater than "
-            "hook_start_sec, never 0/0, never null, never negative. Windows "
-            "should be real musical passages (chorus, drop, build, climax, "
-            "solo, peak) and may vary in length per song."
-        )
-        lines.append("")
-        for index, song in enumerate(songs, start=1):
-            lines.append(
-                f"{index}. [id: {song.get('id')}] {self._desc(song)}"
-            )
-        lines.append("")
-        lines.append(
-            "Return the exact bracketed [id: ...] that appears above for each "
-            "song, with a valid hook_start_sec/hook_end_sec for that song. "
-            "Every song in the list must appear exactly once."
-        )
-        return "\n".join(lines)
-    def _build_prompt(self, songs, previous):
+    def _build_prompt(self, songs, previous, hooks=None):
+        hooks = hooks or {}
         lines = []
         lines.append("You are an expert DJ building one continuous set.")
         lines.append("")
@@ -611,10 +512,11 @@ class Agent:
         lines.append("")
         lines.append(
             "Return the EXACT bracketed [id: ...] for each song. You must: "
-            "(1) order the songs, (2) pick each song's hook window, "
-            "(3) pick the transition into the next song."
+            "(1) order the songs, (2) pick the transition into the next song. "
+            "You do NOT pick hooks — those are already decided, see below."
         )
         lines.append("")
+        lines.append(self._hook_brief(songs, hooks))
         lines.append("SET ARC:")
         lines.append(
             "First state a one-line energy trajectory for the whole set "
@@ -651,41 +553,16 @@ class Agent:
             "rather than forcing it in. Prefer a slightly shorter but "
             "consistently smooth set over including every candidate."
         )
-        lines.append("")
-        lines.append("HOOK SELECTION:")
-        lines.append(
-            "Return hook_start_sec/hook_end_sec: the actual most compelling "
-            "section, using your knowledge of the song. Do NOT default to "
-            "any typical length (e.g. ~30s) out of habit — let the window "
-            "length come from the music itself, and vary it song to song."
-        )
-        lines.append(
-            "NEVER return null, negative, zero-length, or out-of-range hook "
-            "values, and never omit or empty hook_start_sec/hook_end_sec for "
-            "a song you include. There are exactly two mandatory fields per "
-            "song besides its id: hook_start_sec and hook_end_sec — every "
-            "included song MUST have both, filled with real numbers. If you "
-            "are not sure about a song's structure, still give "
-            "a best-guess in-range window — e.g. the strongest passage you "
-            "expect (a drop/build for club tracks, a crescendo or the middle "
-            "movement for classical/orchestral), not timed to the track length "
-            "by formula."
-        )
-        lines.append(
-            "Not every song has a pop-style hook/chorus/drop. For music "
-            "without one — classical, orchestral, jazz, ambient, long-form "
-            "instrumental — pick the strongest passage or movement on its "
-            "own terms (a theme, a climax, a solo), and let the window run "
-            "as long as that passage actually needs, even 60-120s+. Don't "
-            "force this kind of music into a short pop-length clip."
-        )
-        lines.append(
-            "Avoid intro/outro unless it's genuinely the iconic part."
-        )
         lines.append("TRANSITIONS:")
         lines.append(
             "Every consecutive pair needs a transition, including CURRENTLY "
             "PLAYING -> first candidate if applicable."
+        )
+        lines.append(
+            "IMPORTANT: the hook window of each song is ALREADY FIXED and is "
+            "what will actually play. Plan the transition around the material "
+            "inside that window — blend the outgoing song into the first bars "
+            "of the incoming hook, and name those bars in transition_note."
         )
         lines.append(
             "IMPORTANT: attach the transition to the song being ENTERED, not "
@@ -729,9 +606,46 @@ class Agent:
             "Only return IDs from the candidate list, no invented IDs, and "
             "no duplicates. It is fine to omit a candidate if it doesn't fit "
             "the set — do not force in a song just to include every candidate. "
-            "hook_start_sec/hook_end_sec must be valid timestamps inside "
-            "the song. The last song needs no outgoing transition."
+            "The last song needs no outgoing transition."
         )
+        return "\n".join(lines)
+
+    @staticmethod
+    def _hook_brief(songs, hooks):
+        """The hook windows Python already decided, shown to Gemini.
+
+        Gemini is told what will actually play so it can order and blend around
+        the real material, but it cannot move these windows.
+        """
+        lines = ["ALREADY-DECIDED HOOK WINDOWS (measured, do not change these):"]
+        measured = 0
+        for index, song in enumerate(songs, start=1):
+            hook = hooks.get(_norm_sid(song.get("id")))
+            if not hook:
+                continue
+            measured += 1
+            start = float(hook["hook_start_sec"])
+            end = float(hook["hook_end_sec"])
+            if hook.get("hook_source") == "gemini":
+                origin = "estimated from the song's structure"
+            else:
+                origin = (f"YouTube replay peak, seek score "
+                          f"{hook.get('replay_score', 0.0):.2f}")
+            lines.append(
+                f"  #{index} [id: {song.get('id')}] plays "
+                f"{Agent._fmt(start)}-{Agent._fmt(end)} ({end - start:.0f}s) "
+                f"— {origin}"
+            )
+        if not measured:
+            return ""
+        lines.append(
+            "These windows are already fixed: most come from each video's "
+            "YouTube replay heatmap (the seconds real listeners scrub back to), "
+            "and the rest were estimated from the song's structure. Prefer "
+            "ordering so that what plays next lands on a strong hook, and name "
+            "the incoming hook's material in transition_note."
+        )
+        lines.append("")
         return "\n".join(lines)
     @staticmethod
     def _desc(song):
@@ -767,45 +681,47 @@ class Agent:
             f"duration {duration_sec:.0f}s | "
             f"genre {song.get('genre') or '?'}"
         )
-    def _resolve_hook(self, song, entry, clip_length):
-        """Returns (start, end, from_fallback). from_fallback is True when the
-        Gemini-provided hook was missing or invalid, so the set summary can tell
-        real hooks apart from the 33s fallback."""
-        duration_sec = self._duration_seconds(song)
+    def _resolve_hook(self, song, hook, clip_length):
+        """Returns (start, end, source) for one song.
+
+        Precedence, best evidence first:
+            1. "yt_heatmap"       measured from the video's replay heatmap
+            2. "gemini"           the separate hook-only Gemini request
+            3. "middle_section"   the deterministic fallback
+
+        The bounds check below is a last-resort guard, not a tuning pass: a
+        window that already came from real data or from Gemini is used exactly
+        as given. Only a malformed or out-of-range window is replaced.
+        """
+        source = "middle_section"
+        if isinstance(hook, dict):
+            declared = hook.get("hook_source")
+            if declared in ("yt_heatmap", "gemini"):
+                source = declared
         try:
-            start = float(entry.get("hook_start_sec"))
-            end = float(entry.get("hook_end_sec"))
-        except (TypeError, ValueError):
-            return (*self._clip_window(song, clip_length), True)
+            start = float(hook.get("hook_start_sec"))
+            end = float(hook.get("hook_end_sec"))
+        except (AttributeError, TypeError, ValueError):
+            return (*self._clip_window(song, clip_length), "middle_section")
+
+        duration_sec = self._duration_seconds(song)
         if start < 0 or end <= start:
-            return (*self._clip_window(song, clip_length), True)
+            return (*self._clip_window(song, clip_length), "middle_section")
         if duration_sec > 0:
-            start = min(start, duration_sec)
+            if start >= duration_sec:
+                return (*self._clip_window(song, clip_length), "middle_section")
             end = min(end, duration_sec)
             if end <= start:
-                return (*self._clip_window(song, clip_length), True)
+                return (*self._clip_window(song, clip_length), "middle_section")
 
-        min_len = 8.0
-        max_len = 120.0
-        span = end - start
-        if span < min_len:
-            if duration_sec > 0 and start + min_len <= duration_sec:
-                end = start + min_len
-            else:
-                start = max(0.0, end - min_len)
-                end = start + min_len
-        elif span > max_len:
-            end = start + max_len
-            if duration_sec > 0 and end > duration_sec:
-                end = duration_sec
-                start = max(0.0, end - max_len)
-        return (round(start, 1), round(end, 1), False)
+        return (round(start, 1), round(end, 1), source)
 
     def _print_fallback(self, song, clip_length):
         name = (song.get("name") or "Unknown Song").strip()
         print(
             f"[hooks] fallback {float(clip_length or 33.0):.1f}s for "
-            f"'{name}' — Gemini gave no usable hook, using the middle section."
+            f"'{name}' - no replay heatmap and no Gemini hook, "
+            "using the middle section."
         )
     # def _entry_clip_length(self, entry):
     #     try:
@@ -817,11 +733,13 @@ class Agent:
     #     return max(8.0, min(length, 90.0))
     def _clip_window(self, song, clip_length):
         """
-        Safety fallback when Gemini does not provide a valid hook.
+        Safety fallback for songs whose video has no usable replay heatmap.
         Priority:
-        1. Existing hook_start/hook_end from the database.
+        1. Existing hook_start/hook_end on the song.
         2. Middle section of the song.
         3. Beginning if duration is unknown.
+
+        A song shorter than clip_length is returned whole rather than truncated.
         """
         desired_length = float(clip_length or 33.0)
         desired_length = max(1.0, desired_length)
@@ -836,7 +754,10 @@ class Agent:
                     if duration > 0:
                         start = max(0.0, min(start, duration))
                         end = max(start, min(end, duration))
-                    return (round(start, 1), round(end, 1))
+                    # A stored hook that lies entirely past the end clamps to a
+                    # zero-length window; drop it and use the middle section.
+                    if end > start:
+                        return (round(start, 1), round(end, 1))
             except (TypeError, ValueError):
                 pass
         if duration <= 0:

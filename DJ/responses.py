@@ -66,7 +66,9 @@ def save_response(response, place=None):
                           windows and transition_out included per song)
         transitions_json  every transition_out, in play order, labelled with
                           which pair it joins
-        hooks_json        each song's hook window + clip length, in play order
+        hooks_json        each song's hook window + clip length + how it was
+                          chosen (yt_heatmap / gemini / middle_section) and
+                          the replay peak, in play order
         raw_json          the unmodified original response
 
     The Agent table's ``place`` column stores ONLY the run's single place key
@@ -108,6 +110,12 @@ def save_response(response, place=None):
             "play_start": item.get("play_start"),
             "play_end": item.get("play_end"),
             "clip_length": item.get("clip_length"),
+            # How this window was chosen: yt_heatmap (measured from the
+            # video's replay heatmap), gemini (estimated by a hook-only
+            # request) or middle_section (neither was available).
+            "hook_source": item.get("hook_source"),
+            "replay_peak_sec": item.get("replay_peak_sec"),
+            "replay_score": item.get("replay_score"),
         })
 
     # Each song's transition_out joins it to the NEXT song, so pair every non-

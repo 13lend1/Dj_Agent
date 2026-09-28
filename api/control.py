@@ -455,6 +455,30 @@ def set_place(body: PlaceBody):
             "genres": list(PLACE_GENRES.get(key, []))}
 
 
+@router.delete("/place")
+def remove_place(place: str):
+    """Delete a custom place along with all of its data: its catalog and pool
+    rows, its playlist history and its model pickle.
+
+    Only custom places can be deleted — the built-ins ship with the app. The deck
+    must be stopped first, exactly like changing the place, so nothing is pulled
+    out of the pool mid-playback.
+    """
+    from Music.preference import delete_place
+    from api import session
+
+    if session.is_running():
+        raise HTTPException(409, "Stop the DJ before deleting a place.")
+
+    try:
+        result = delete_place(place)
+    except ValueError as exc:
+        # Unknown or built-in name. 404 reads right for both from the UI's
+        # point of view: there is no deletable place by that name.
+        raise HTTPException(404, str(exc))
+    return {"ok": True, **result}
+
+
 @router.post("/skip")
 def skip():
     if _debounced("skip"):

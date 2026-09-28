@@ -47,15 +47,36 @@ class Player:
         self._ensure_genre_tables()
 
     def _ensure_genre_tables(self):
-        """Create the per-genre 'played songs' tables so every genre has one."""
+        """Create the per-genre 'played songs' tables so every genre has one,
+        and trim any that have grown past the played-history cap (an existing
+        database is brought under it once here, rather than waiting for each
+        genre to be played again)."""
         try:
-            from duplicates import genre_table
+            from duplicates import (
+                genre_table,
+                prune_orphans,
+                trim_all_genre_tables,
+            )
             from songs import GENRES, ARTISTS
             for genre in set(list(GENRES) + list(ARTISTS.values())):
                 try:
                     genre_table(genre)
                 except Exception:
                     pass
+            trimmed = trim_all_genre_tables()
+            if trimmed:
+                total = sum(trimmed.values())
+                print(f"Trimmed {total} over-cap played row(s) across "
+                      f"{len(trimmed)} genre table(s): {trimmed}", flush=True)
+
+            # Drop played-marks for songs whose Songs row was removed after they
+            # were played but never scored (delete_unscored_songs). Those marks
+            # can never gate playback, and each one would otherwise consume a
+            # slot of the 1000-row window above.
+            pruned = prune_orphans()
+            if pruned:
+                print(f"Pruned {pruned} orphaned played row(s) with no Songs "
+                      "entry.", flush=True)
         except Exception as e:
             print("Failed to ensure genre tables:", e)
 

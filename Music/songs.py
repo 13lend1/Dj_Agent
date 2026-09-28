@@ -678,6 +678,17 @@ def get_random_songs(n=20, max_attempts=5, batch_size=5, on_song=None, workers=3
                     on_song(song)
                 songs.append(song)
 
+    # Feature-cache writes are batched during the run; land them now so a fill
+    # that ends here doesn't leave its work sitting in memory.
+    try:
+        from Music.audio_specs import flush_cache
+    except ImportError:
+        from audio_specs import flush_cache
+    try:
+        flush_cache()
+    except Exception:
+        pass
+
     return songs
 
 
@@ -1092,6 +1103,66 @@ def purge_stale_preprocessed(place, genres):
             conn.execute("ROLLBACK")
             raise
     return _db_exec(_run)
+
+
+def delete_place_songs(place):
+    """Deletes every row belonging to `place` and returns the per-table counts.
+
+    Removes the place's catalog (Songs), its unplayed pool (Preprocessed) and
+    its playlist history (Agent). Only the three place-tagged tables are
+    touched — the per-genre "played" tables and the song-level caches
+    (feature/heatmap/cover) are keyed by song or genre, not by place, and are
+    shared with every other place, so they must survive.
+
+    Songs rows are deleted too, not just the pool: they are what the place's
+    model trains on, so leaving them behind would let a place recreated under
+    the same name silently inherit its old likes/dislikes.
+
+    All three deletes share one transaction so a place can never be left
+    half-deleted. Safe to call for a place that has no rows (0 counts), and
+    safe to call for a name that is no longer a place at all — that is exactly
+    the orphaned-tag case ('energetic', 'rooftop'), so it must be keyed on the
+    place string rather than looked up in the registry.
+    """
+    if not place:
+        return {"songs": 0, "preprocessed": 0, "agent": 0}
+    removed = {}
+
+    def _run(conn):
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            counts = {}
+            for table, label in (("Songs", "songs"),
+                                 ("Preprocessed", "preprocessed"),
+                                 ("Agent", "agent")):
+                # The Agent table is created lazily by DJ/responses.py, and
+                # `place` is an ALTERed column on the shipped DBs, so check
+                # both before issuing the delete.
+                exists = conn.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+                    (table,)).fetchone()
+                if not exists:
+                    counts[label] = 0
+                    continue
+                cols = {r[1] for r in conn.execute(f'PRAGMA table_info("{table}")')}
+                if "place" not in cols:
+                    counts[label] = 0
+                    continue
+                cur = conn.execute(f'DELETE FROM "{table}" WHERE place = ?', (place,))
+                counts[label] = cur.rowcount
+            conn.execute("COMMIT")
+            return counts
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+
+    removed = _db_exec(_run)
+    total = sum(removed.values())
+    if total:
+        print(f"Deleted {removed['songs']} song(s), "
+              f"{removed['preprocessed']} pool row(s) and "
+              f"{removed['agent']} run(s) for '{place}'.", flush=True)
+    return removed
 
 
 def preprocessed_count(place=None, genres=None):

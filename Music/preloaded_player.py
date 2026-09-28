@@ -20,13 +20,25 @@ from Music.player import Player
 
 class PreloadedPlayer(Player):
 
-    def __init__(self, pool_size=20, top_n=8):
+    # How many songs the very first batch of a fresh place queues. These go out
+    # through the fast deterministic path (no model, no AI calls), so the click
+    # that picks a place starts music immediately — but they are also the buffer
+    # that hides the very slow second batch, which has to wait on the pool, the
+    # model's retrain, hook resolution and Gemini ordering. Buffering only a
+    # couple of songs meant the deck ran dry straight back into that stall.
+    DEFAULT_FIRST_BATCH_N = 8
+
+    def __init__(self, pool_size=20, top_n=8, first_batch_n=None):
         super().__init__()
         self.song_queue = queue.Queue(maxsize=2)
         self.batch = []
         self.batch_lock = threading.Lock()
         self.pool_size = pool_size
         self.top_n = top_n
+        self.first_batch_n = first_batch_n or self.DEFAULT_FIRST_BATCH_N
+        # Set by _batch_worker once the first batch is queued, so the refill
+        # worker can switch from "get the place started" to steady top-up.
+        self.started = threading.Event()
         self.model = None  # lazy import to avoid circular dependency at module load
         self._preload_procs_lock = threading.Lock()
         self._preload_processes = set()  # in-flight decode processes, killed on stop
@@ -44,11 +56,16 @@ class PreloadedPlayer(Player):
     def _refill_worker(self, low_water=None, check_interval=5):
         """Keep the Preprocessed pool topped up nonstop while the DJ is active.
 
-        Instead of waiting until the pool runs dry (one fetch, then idle), it
-        rolls toward a high-water mark: finishing one fetch chunk then starting
-        the next immediately as long as the pool is below target. Candidates are
-        also inserted progressively inside each chunk, so the batch worker and
-        playback always find pool ready.
+        Nothing is pre-warmed ahead of time: the pool is filled on demand, and
+        what "on demand" means depends on whether the place is already audible.
+
+        Before the first batch is queued the goal is only to get the place
+        playing, so this aims for exactly one batch's worth of songs instead of
+        grinding toward the high-water mark while nobody is listening. Once
+        `started` is set, it rolls toward the high-water mark: finishing one
+        fetch chunk then starting the next immediately as long as the pool is
+        below target. Candidates are also inserted progressively inside each
+        chunk, so the batch worker and playback always find pool ready.
 
         Once discovery runs dry (refill keeps coming back short), it backs off
         and lets the batch path recycle already-played songs so the deck keeps
@@ -57,10 +74,15 @@ class PreloadedPlayer(Player):
             low_water = self.pool_size
         top_n = getattr(self, 'top_n', None) or low_water
         high_water = getattr(self, 'prefill_high_water', None) or max(2 * low_water, low_water + top_n)
-        max_chunk = 15  # lean fetch rounds: the first batch needs only ~10, so
-        # small rounds start playback sooner and the loop chains them in the
-        # background instead of one big grab before anything plays
+        max_chunk = 15  # lean fetch rounds: small rounds start playback sooner
+        # Enough to cover the fast first batch and nothing more.
+        warm_target = min(high_water,
+                          max(int(getattr(self, 'first_batch_n', 0) or 0), 4))
+        started = getattr(self, 'started', None)
+        boot_at = time.time()
         dry_rounds = 0
+        need = 0  # initialised so the back-off below is safe even if the first
+                  # round raises before it is computed
         while not self.stop_event.is_set():
             try:
                 # The batch borrows across places but genre-filtered, so track
@@ -74,15 +96,38 @@ class PreloadedPlayer(Player):
                 _place = getattr(self, 'place', None)
                 _genres = PLACE_GENRES.get(_place) if _place else None
                 count = preprocessed_count(genres=_genres)
-                need = high_water - count
-                if need >= 5:
+
+                audible = bool(started and started.is_set())
+                # If the place still has not started after a while, discovery is
+                # slow rather than the pool being full: stop waiting on the
+                # small warm target and get ahead of playback instead.
+                if not audible and time.time() - boot_at > 60:
+                    audible = True
+                target = high_water if audible else warm_target
+                need = target - count
+                # A single missing song is worth fetching while getting the
+                # place started; in steady state, wait for a worthwhile gap so
+                # the APIs are not polled for one row at a time.
+                trigger = 5 if audible else 1
+
+                if need >= trigger:
+                    want = min(need, max_chunk)
+                    t0 = time.time()
                     fetched = get_random_songs(
-                        n=min(need, max_chunk),
+                        n=want,
                         on_song=save_preprocessed,
                         place=getattr(self, 'place', None),
                         workers=6,
                     )
-                    if not fetched or len(fetched) < min(need, max_chunk) // 2:
+                    took = time.time() - t0
+                    got = len(fetched)
+                    if got:
+                        phase = "steady" if audible else "startup"
+                        rate = got / took if took > 0 else 0.0
+                        print(f"[refill] {phase}: +{got} song(s) in {took:.1f}s "
+                              f"({rate:.1f}/s), pool {count} -> {count + got}"
+                              f"/{target}", flush=True)
+                    if not fetched or len(fetched) < want // 2:
                         dry_rounds += 1
                     else:
                         dry_rounds = 0
@@ -94,20 +139,29 @@ class PreloadedPlayer(Player):
                 dry_rounds += 1
             # Back off hard once the catalog looks fully harvested: recycling
             # already covers playback, so there is no need to keep scraping.
-            time.sleep(check_interval if dry_rounds < 3 else 60)
+            # Otherwise stay responsive: chain the next chunk promptly while the
+            # pool is still short.
+            if dry_rounds >= 3:
+                pause = 60
+            elif dry_rounds:
+                pause = check_interval
+            else:
+                pause = 1 if need > 0 else check_interval
+            time.sleep(pause)
 
-    def _batch_worker(self, check_interval=2, first_batch_n=2):
+    def _batch_worker(self, check_interval=2, first_batch_n=None):
         """Keep the queue stocked.
 
-        The first fetch is a SMALL batch: as soon as ~`first_batch_n` full
-        songs exist in the Preprocessed pool they are pulled and run through
-        the whole pipeline (model -> agent), so playback starts fast while
-        still being model-scored and agent-ordered. Everything after that is
-        the normal scored batching."""
+        The first fetch is a SMALL batch: as soon as `first_batch_n` full songs
+        exist in the Preprocessed pool they are pulled and queued straight away,
+        so playback starts fast without waiting on the model, hook resolution or
+        Gemini. Those songs are also the buffer that covers the slow normal
+        batch that follows. Everything after that is the normal scored batching.
+        """
         if first_batch_n is None:
             first_batch_n = getattr(self, 'first_batch_n', None)
-        if first_batch_n is None:
-            first_batch_n = 2
+        if not first_batch_n:
+            first_batch_n = self.DEFAULT_FIRST_BATCH_N
         first = True
         while not self.stop_event.is_set():
             try:
@@ -165,6 +219,9 @@ class PreloadedPlayer(Player):
                 if first:
                     self._fetch_batch(n=first_batch_n, small=True)
                     first = False
+                    # The place is now audible; the refill worker can switch from
+                    # "get to the first song" to steady top-up.
+                    self.started.set()
                 else:
                     self._fetch_batch()
             except Exception as e:

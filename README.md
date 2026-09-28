@@ -13,16 +13,16 @@ DJ Agent is not your ordinary music player. It's built for **background music**:
 - **Made to run in the background.** Start it, minimize it, forget it. Global hotkeys let you skip, like or dislike from any window.
 - **Fresh music, not the same loop.** Songs are discovered from YouTube Music and filtered by the genres of your active place, so a `study` session never plays party tracks.
 - **It learns you, per place.** Each place has its own preference model, trained from your likes and dislikes. What you like in the car isn't what you like while coding.
-- **Hook-based playback.** A Gemini agent finds the build-up and drop of each song, so the DJ plays the part worth hearing and cuts at musically sensible points instead of playing tracks end to end.
+- **Hook-based playback.** Each song's hook comes from its YouTube replay heatmap — the seconds real listeners scrub back to — so the DJ plays the part worth hearing instead of guessing a chorus or playing tracks end to end.
 - **No waiting.** The next song is preloaded in memory and a background thread keeps a preprocessed pool full, so playback never stalls.
 
 ## How it works
 
 1. **Prefill / refill** (`Music/songs.py`): searches YouTube Music and saves songs plus audio specs (tempo, energy, key, ...) into `Database/music.db`.
-2. **Preprocessing** (`Music/audio_specs.py`): decodes a short clip of each candidate and extracts features. The best candidates go into the `Preprocessed` pool. A small first batch is processed fast on the very first run, then a background refill keeps the pool near its high-water mark.
+2. **Preprocessing** (`Music/audio_specs.py`): decodes a short clip of each candidate and extracts features. The best candidates go into the `Preprocessed` pool. Nothing is warmed up ahead of time — the pool is filled on demand, targeted at the place you just clicked. Until that place is audible the filler only aims for one batch's worth of songs, and once playback has started it keeps the pool near its high-water mark, replacing what has been consumed. Audio-feature results are cached on disk and written in batches, so a fill is not dominated by JSON serialization.
 3. **Scoring** (`Model/linear_regression.py`): a per-place model (`models/<place>.pkl`) predicts how much you'll like each track and retrains automatically as like/dislike records accumulate. With too few records, selection falls back to random.
-4. **Choosing** (`DJ/agent.py`): a Gemini agent builds the next playlist, picks tracks that fit the vibe, selects transition effects, and returns the hook timestamps to cut on.
-5. **Playing** (`Music/preloaded_player.py`, `Music/dj.py`): songs are preloaded so the next track starts instantly. Skips land on the saved hook point (no full song unless you ask). On a skip, the server waits up to ~0.8 s for the swap and returns the new song's state in the `POST /api/control/skip` response, so the UI updates with no extra poll.
+4. **Choosing** (`DJ/agent.py`): every song's hook window is resolved in three steps — measured from its YouTube replay heatmap (`Music/heatmap.py`, cached), then, for videos that publish no heatmap, estimated by a separate hook-only Gemini request (`Music/gemini_hooks.py`), and only then falling back to the song's middle section. A Gemini agent then builds the next playlist around those windows — picking the track order, the transition effects, and what each transition blends into. Hooks are resolved before ordering and never re-guessed.
+5. **Playing** (`Music/preloaded_player.py`, `Music/dj.py`): songs are preloaded so the next track starts instantly. The click that picks a place queues a first batch immediately through the fast path — deterministic middle-section hooks, no model and no AI calls — and that batch is the buffer covering the slow second batch, so the deck keeps playing while scoring, hooks and Gemini ordering catch up. Skips land on the saved hook point (no full song unless you ask). On a skip, the server waits up to ~0.8 s for the swap and returns the new song's state in the `POST /api/control/skip` response, so the UI updates with no extra poll.
 
 ## Quick start (Windows)
 
@@ -87,13 +87,15 @@ This writes `Music/headers_auth.json`. If the file is missing, the DJ silently u
 uv run python api/server.py
 ```
 
-Open http://127.0.0.1:8000, pick a place, and the DJ starts. `Database/music.db` ships with a starter catalog and preprocessed pool, and the schema is created automatically if the file is missing.
+Open http://127.0.0.1:8000, pick a place, and the DJ starts. `Database/music.db` is git-ignored and does not ship, so a fresh clone has no catalog: the schema is created automatically and the DJ discovers and preprocesses songs on demand, which makes the first few minutes slower than a warm install. The per-place models in `models/` are git-ignored as well, so a clone has no like/dislike history and picks at random until you rate a few songs.
 
 ## Places & genres
 
 A place is just a name mapped to a genre list (see `Music/preference.py`; `DEFAULT_PLACE` is `car`). Ships with: car, home, restaurant, gym, party, study, sleep, office, beach, walk, rave, date_night, road_trip, cooking, focus_coding, gaming.
 
 Create your own from the UI (Stop → pick → "Create a new place"); they're saved to `Database/places.json`. Songs may be borrowed from any place's pool, but an active place only ever plays songs whose genre is in **its** list.
+
+Custom places can be deleted from the same screen with the `×` on their tile (or `DELETE /api/control/place?place=<name>`). That permanently removes the place along with its songs, its unplayed pool, its playlist history and its trained model (`models/<place>.pkl`) — so it asks for confirmation first, and the DJ must be stopped. The 16 built-in places cannot be deleted. The per-genre tables and the song-level caches (audio features, heatmaps, covers) are shared across places and are kept.
 
 ## Controls
 
@@ -130,15 +132,18 @@ python api/server.py --host 0.0.0.0 --port 8000
 
 ```
 api/                FastAPI server + control endpoints (status, skip, rate...)
-DJ/                 Gemini agent: playlist, effects, hook timings, responses
+DJ/                 Gemini agent: playlist order, effects, responses
 Model/              Per-place linear-regression preference models
 Music/              Discovery, preprocessing, audio features, player, places/genres
+                    (heatmap.py resolves each song's hook from YouTube;
+                    gemini_hooks.py estimates hooks for videos with no heatmap)
 ui/                 Browser DJ deck (vanilla JS, /app.js + /style.css)
-Database/           music.db (starter catalog), places.json, cover cache
+Database/           music.db (created on first run), places.json, cover cache
 effects/            Downloaded CC0/Attribution transition SFX (Freesound)
 models/             Trained per-place .pkl files
 hotkeys.py          Windows global Ctrl+Alt hotkey daemon
-test_gemini_hooks.py, test_hook_repair.py   offline regression tests
+test_hook_repair.py     offline heatmap-hook + fallback regression tests
+test_gemini_hooks.py    live heatmap + Gemini test (needs DJ_TESTS_LIVE=1)
 ```
 
 Dependencies are managed with `pyproject.toml` + `uv.lock` (no `requirements.txt`).

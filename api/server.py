@@ -93,10 +93,7 @@ def main():
     import uvicorn
 
     print(f"UI: http://{args.host}:{args.port}/")
-    # timeout_graceful_shutdown: one Ctrl+C stops the DJ (via the app lifespan,
-    # which closes the StreamSink) and uvicorn force-exits after 5s even if a
-    # browser /stream connection never drains. Without this the first Ctrl+C
-    # hangs waiting for connections and you need repeated presses.
+
     uvicorn.run(
         "api.app:app",
         host=args.host,

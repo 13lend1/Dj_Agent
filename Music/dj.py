@@ -63,12 +63,12 @@ class DJ(PreloadedPlayer):
     the hook end, and the rate/skip + save-to-Songs cycle is unchanged.
     """
 
-    def __init__(self, pool_size=50, top_n=15, clip_length=33, resume_unplayed=None, resume_place=None, trial=False):
+    def __init__(self, pool_size=50, top_n=15, clip_length=33, resume_unplayed=None, resume_place=None, trial=False, first_batch_n=None):
         # TRIAL FAST-START: a place with nothing preprocessed yet used to play
         # its first ~10 fetched songs RAW (bypassing the model + Agent ordering)
         # to get audio going as fast as possible. The base-class first batch now
-        # covers that: it pulls a small batch (~3 songs) as soon as they exist
-        # and runs it through the regular model-scored, agent-ordered pipeline.
+        # covers that: it pulls a small batch as soon as they exist and runs it
+        # through the regular model-scored, agent-ordered pipeline.
         # The trial budget is therefore always 0, so no raw path ever runs.
         # Must be set before super().__init__() spawns the worker threads.
         self._trial = trial
@@ -115,7 +115,8 @@ class DJ(PreloadedPlayer):
         # self.agent (an AttributeError retried away). Agent() only builds the
         # genai client — no network happens here.
         self.agent = Agent()
-        super().__init__(pool_size=pool_size, top_n=top_n)
+        super().__init__(pool_size=pool_size, top_n=top_n,
+                         first_batch_n=first_batch_n)
         self.clip_length = clip_length
         self.current_clip_duration = None
         self._advance_fail_count = 0
@@ -313,6 +314,13 @@ class DJ(PreloadedPlayer):
                                  "reached the scored-record threshold).")
             top = self.model.select_best(candidates, n=self.top_n)
             records = top.to_dict('records')
+            if not records:
+                # select_best() drops candidates it cannot score (missing audio
+                # features) and hands back an empty frame instead of raising, so
+                # the random fallback has to be triggered explicitly. Without
+                # this the batch queues nothing at all and the deck goes silent
+                # on a pool whose rows have no features.
+                raise ValueError("no candidate in the pool was scoreable")
         except Exception as e:
             print("Scoring unavailable, selecting randomly instead:", e)
             records = random.sample(candidates, min(self.top_n, len(candidates)))
@@ -333,7 +341,26 @@ class DJ(PreloadedPlayer):
                 song["play_end"] = Agent._fmt(end)
                 song["clip_length"] = round(max(0.0, end - start), 1)
                 song["hook_length"] = round(max(0.0, end - start), 1)
+                # Provenance: no heatmap and no Gemini ran for this batch, so the
+                # window is the deterministic middle-section fallback. Recorded
+                # explicitly, otherwise the response layer would report an
+                # unknown source for every fast-started song.
+                song["hook_source"] = "middle_section"
                 song["transition_out"] = None
+            # The first batch is now several songs long and they play back to
+            # back, so they still need transitions. _finalize_transitions only
+            # converts decisions into structures (and falls back to its
+            # deterministic choices with no Gemini reply), so this costs no AI
+            # calls and no extra latency — without it the whole fast batch would
+            # play with hard cuts and no effects.
+            try:
+                with self.batch_lock:
+                    prev = self.batch[-1] if self.batch else None
+                if not prev:
+                    prev = getattr(self, 'current_song', None)
+                self.agent._finalize_transitions(records, previous=prev)
+            except Exception as e:
+                print("Fast-start transition layout failed, using hard cuts:", e)
             with self.batch_lock:
                 self.batch.extend(records)
             if records:

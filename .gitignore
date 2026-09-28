@@ -18,6 +18,7 @@ music.db
 Database/cover_cache.json
 Database/places.json
 Music/feature_cache.json
+Music/heatmap_cache.json
 
 # Personal per-place preference models (trained locally, never shared)
 models/*.pkl
